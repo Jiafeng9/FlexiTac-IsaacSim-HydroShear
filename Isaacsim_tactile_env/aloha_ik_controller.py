@@ -16,25 +16,7 @@ from isaaclab.assets import Articulation
 from isaaclab.controllers.differential_ik import DifferentialIKController
 from isaaclab.controllers.differential_ik_cfg import DifferentialIKControllerCfg
 
-# Dataset joint order (same as aloha_tactile_env.py)
-DATASET_JOINT_ORDER = [
-    "left/waist",
-    "left/shoulder",
-    "left/elbow",
-    "left/forearm_roll",
-    "left/wrist_angle",
-    "left/wrist_rotate",
-    "left/left_finger",
-    "left/right_finger",
-    "right/waist",
-    "right/shoulder",
-    "right/elbow",
-    "right/forearm_roll",
-    "right/wrist_angle",
-    "right/wrist_rotate",
-    "right/left_finger",
-    "right/right_finger",
-]
+from aloha.cfg import DATASET_JOINT_ORDER
 
 # Left arm: 6 revolute joints for IK
 LEFT_ARM_JOINT_NAMES = [

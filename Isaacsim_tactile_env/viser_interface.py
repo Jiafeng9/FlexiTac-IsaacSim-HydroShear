@@ -14,10 +14,39 @@ import torch
 # --- SimulationApp MUST be created before any omni/isaaclab imports ---
 from isaaclab.app import AppLauncher
 
-parser = argparse.ArgumentParser(description="ALOHA bimanual drag control and visualization for current aloha_tactile_env")
+parser = argparse.ArgumentParser(description="ALOHA bimanual drag control and visualization")
 parser.add_argument("--port", type=int, default=8080, help="Viser server port")
 parser.add_argument("--save_dir", type=str, default="", help="Directory for saved trajectory .npz files")
 parser.add_argument("--slow_interval", type=int, default=8, help="UI refresh interval for expensive updates")
+parser.add_argument(
+    "--compare_hydro_normal",
+    action="store_true",
+    help="Show original WarpSDF normal, HydroShear normal, and HydroShear shear x/y.",
+)
+parser.add_argument(
+    "--tactile_backend",
+    choices=("normal", "taxel_shear", "surface_hydro"),
+    default="normal",
+    help="Main tactile backend: original normal, taxel-level shear, or surface-point HydroShear.",
+)
+parser.add_argument(
+    "--hydro_normal_scale",
+    type=float,
+    default=1.0,
+    help="Readout scale applied to HydroShear normal values in --compare_hydro_normal mode.",
+)
+parser.add_argument(
+    "--hydro_shear_scale",
+    type=float,
+    default=1.0,
+    help="Readout scale applied to HydroShear shear x/y values in --compare_hydro_normal mode.",
+)
+parser.add_argument(
+    "--hydro_shear_stiffness",
+    type=float,
+    default=None,
+    help="Optional HydroShear tangential stiffness override in --compare_hydro_normal mode.",
+)
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
 
@@ -27,92 +56,11 @@ simulation_app = app_launcher.app
 # --- Now safe to import everything else ---
 sys.path.insert(0, str(Path(__file__).parent))
 from aloha_ik_controller import AlohaArmIKController
-from aloha_tactile_env import AlohaTactileEnv, AlohaTactileEnvCfg
-
-
-def patch_env_spawn_objects_for_socket_articulation_fix():
-    """Spawn plug/socket normally, but disable articulation roots on converted object USDs when possible."""
-
-    def _spawn_plug_socket_fixed(self, cfg, sim_utils, RigidObject, RigidObjectCfg):
-        from utils.utils import _xyzw_to_wxyz
-
-        plug_obj = None
-        socket_obj = None
-
-        objs_out_dir = os.path.join(os.path.dirname(__file__), "output", "automate_scaled_urdf")
-        os.makedirs(objs_out_dir, exist_ok=True)
-
-        if not (getattr(cfg, "enable_plug", False) or getattr(cfg, "enable_socket", False)):
-            return plug_obj, socket_obj
-
-        automate_dir = os.path.join(os.path.expanduser(cfg.asset_root), "automate_scaled", "urdf")
-        plug_urdf = os.path.join(automate_dir, f"{cfg.automate_asset_id}_plug.urdf")
-        socket_urdf = os.path.join(automate_dir, f"{cfg.automate_asset_id}_socket.urdf")
-
-        def _make_spawn_cfg(urdf_path: str, fix_base: bool, collider_type: str):
-            spawn_kwargs = dict(
-                asset_path=urdf_path,
-                scale=None,
-                fix_base=fix_base,
-                joint_drive=None,
-                link_density=1000.0,
-                usd_dir=objs_out_dir,
-                force_usd_conversion=getattr(cfg, "force_objects_urdf_conversion", False),
-                collider_type=collider_type,
-                activate_contact_sensors=False,
-            )
-            spawn_cfg = sim_utils.UrdfFileCfg(**spawn_kwargs)
-
-            try:
-                art_root_cfg = None
-                try:
-                    from isaaclab.sim.schemas import ArticulationRootPropertiesCfg  # type: ignore
-                    art_root_cfg = ArticulationRootPropertiesCfg(articulation_enabled=False)
-                except Exception:
-                    try:
-                        from isaaclab.sim.schemas.schemas_cfg import ArticulationRootPropertiesCfg  # type: ignore
-                        art_root_cfg = ArticulationRootPropertiesCfg(articulation_enabled=False)
-                    except Exception:
-                        art_root_cfg = None
-
-                if art_root_cfg is not None:
-                    if hasattr(spawn_cfg, "articulation_props"):
-                        spawn_cfg.articulation_props = art_root_cfg
-                    elif hasattr(spawn_cfg, "articulation_root_props"):
-                        spawn_cfg.articulation_root_props = art_root_cfg
-                    elif hasattr(spawn_cfg, "usd_config") and hasattr(spawn_cfg.usd_config, "articulation_props"):
-                        spawn_cfg.usd_config.articulation_props = art_root_cfg
-            except Exception as e:
-                print(f"[WARN] Could not attach articulation-root fix for {os.path.basename(urdf_path)}: {e}", flush=True)
-
-            return spawn_cfg
-
-        def spawn_one(urdf_path: str, pose, prim_path: str, fix_base: bool, collider_type: str):
-            if not os.path.isfile(urdf_path):
-                return None
-            pos = tuple(float(v) for v in pose[:3])
-            rot = _xyzw_to_wxyz(pose[3:7])
-            return RigidObject(RigidObjectCfg(
-                prim_path=prim_path,
-                spawn=_make_spawn_cfg(urdf_path, fix_base, collider_type),
-                init_state=RigidObjectCfg.InitialStateCfg(pos=pos, rot=rot),
-            ))
-
-        if getattr(cfg, "enable_plug", False):
-            plug_obj = spawn_one(
-                plug_urdf, cfg.plug_default_pose, "/World/Plug",
-                getattr(cfg, "plug_fix_base", False), getattr(cfg, "plug_collider_type", "convex_decomposition"),
-            )
-
-        if getattr(cfg, "enable_socket", False):
-            socket_obj = spawn_one(
-                socket_urdf, cfg.socket_default_pose, "/World/Socket",
-                getattr(cfg, "socket_fix_base", False), getattr(cfg, "socket_collider_type", "convex_decomposition"),
-            )
-
-        return plug_obj, socket_obj
-
-    AlohaTactileEnv._spawn_plug_socket = _spawn_plug_socket_fixed
+from aloha.camera import AlohaCameraCfg
+from aloha.cfg import AlohaTactileEnvCfg, DATASET_JOINT_ORDER
+from aloha.env import AlohaTactileEnv
+from aloha.scene import AlohaSimCfg
+from aloha.tactile import HydroShearTactileBackendCfg, TaxelShearTactileBackendCfg
 
 
 # ---------------------------------------------------------------------------
@@ -126,15 +74,76 @@ def _jet_colormap(v: np.ndarray) -> np.ndarray:
     return (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
 
 
-def tactile_to_rgb(grid: np.ndarray, scale: int = 8) -> np.ndarray:
+def tactile_to_rgb(grid: np.ndarray, scale: int = 8, vmax: float | None = None) -> np.ndarray:
     from PIL import Image
 
-    vmax = float(grid.max())
+    grid = tactile_normal_channel(grid)
+    vmax = float(grid.max()) if vmax is None else float(vmax)
     normed = grid / (vmax + 1e-8) if vmax > 0 else np.zeros_like(grid)
     rgb = _jet_colormap(normed)
     img = Image.fromarray(rgb)
     img = img.resize((grid.shape[1] * scale, grid.shape[0] * scale), Image.NEAREST)
     return np.array(img)
+
+
+def tactile_normal_channel(grid: np.ndarray) -> np.ndarray:
+    grid = np.asarray(grid)
+    if grid.ndim >= 3 and grid.shape[-1] == 3:
+        return grid[..., 0]
+    return grid
+
+
+def tactile_shear_uv(grid: np.ndarray | None) -> np.ndarray | None:
+    if grid is None:
+        return None
+    grid = np.asarray(grid)
+    if grid.ndim >= 3 and grid.shape[-1] == 3:
+        return grid[..., 1:3]
+    return grid
+
+
+def signed_tactile_to_rgb(grid: np.ndarray, scale: int = 8, vmax: float | None = None) -> np.ndarray:
+    from PIL import Image
+
+    vmax = float(np.max(np.abs(grid))) if vmax is None else float(vmax)
+    if vmax <= 0.0:
+        rgb = np.full(grid.shape + (3,), 255, dtype=np.uint8)
+    else:
+        signed = np.clip(grid / (vmax + 1e-8), -1.0, 1.0)
+        mag = np.abs(signed)
+        base = (255.0 * (1.0 - mag)).astype(np.uint8)
+        rgb = np.empty(grid.shape + (3,), dtype=np.uint8)
+        positive = signed >= 0.0
+        rgb[..., 0] = np.where(positive, 255, base)
+        rgb[..., 1] = base
+        rgb[..., 2] = np.where(positive, base, 255)
+    img = Image.fromarray(rgb)
+    img = img.resize((grid.shape[1] * scale, grid.shape[0] * scale), Image.NEAREST)
+    return np.array(img)
+
+
+def _label_rgb(img: np.ndarray, text: str) -> np.ndarray:
+    from PIL import Image, ImageDraw, ImageFont
+
+    pil = Image.fromarray(img)
+    draw = ImageDraw.Draw(pil)
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 14)
+    except Exception:
+        font = ImageFont.load_default()
+    lines = str(text).splitlines()
+    label_h = max(22, 18 * len(lines) + 4)
+    draw.rectangle((0, 0, pil.width, label_h), fill=(0, 0, 0))
+    for i, line in enumerate(lines):
+        draw.text((5, 3 + 18 * i), line, fill=(255, 255, 255), font=font)
+    return np.asarray(pil)
+
+
+def _fmt_scalar(value: float) -> str:
+    value = float(value)
+    if 0.0 < abs(value) < 1.0e-3 or abs(value) >= 1.0e4:
+        return f"{value:.3e}"
+    return f"{value:.4f}"
 
 
 # ---------------------------------------------------------------------------
@@ -254,18 +263,6 @@ class SharedState:
 shared = SharedState()
 
 
-# ---------------------------------------------------------------------------
-# Joint name mapping
-# ---------------------------------------------------------------------------
-
-DATASET_JOINT_ORDER = [
-    "left/waist", "left/shoulder", "left/elbow", "left/forearm_roll",
-    "left/wrist_angle", "left/wrist_rotate", "left/left_finger", "left/right_finger",
-    "right/waist", "right/shoulder", "right/elbow", "right/forearm_roll",
-    "right/wrist_angle", "right/wrist_rotate", "right/left_finger", "right/right_finger",
-]
-
-
 def build_joint_name_map(urdf_joint_names):
     mapping = []
     dataset_lower = [n.lower() for n in DATASET_JOINT_ORDER]
@@ -330,6 +327,28 @@ class TrajectoryRecorder:
         self._append("right_actions", right_action)
         self._append("actions", np.concatenate([left_action, right_action], axis=0))
         self._append("tactile", obs["tactile"])
+        if "tactile_force" in obs:
+            self._append("tactile_force", obs["tactile_force"])
+        if "tactile_shear" in obs:
+            self._append("tactile_shear", obs["tactile_shear"])
+        if "tactile_slip_ratio" in obs:
+            self._append("tactile_slip_ratio", obs["tactile_slip_ratio"])
+        if "tactile_shear_vector_w" in obs:
+            self._append("tactile_shear_vector_w", obs["tactile_shear_vector_w"])
+        if "tactile_hydro" in obs:
+            self._append("tactile_hydro", obs["tactile_hydro"])
+        if "tactile_hydro_force" in obs:
+            self._append("tactile_hydro_force", obs["tactile_hydro_force"])
+        if "tactile_hydro_shear" in obs:
+            self._append("tactile_hydro_shear", obs["tactile_hydro_shear"])
+        if "tactile_marker" in obs:
+            self._append("tactile_marker", obs["tactile_marker"])
+        if "tactile_marker_shear" in obs:
+            self._append("tactile_marker_shear", obs["tactile_marker_shear"])
+        if "tactile_hydro_marker" in obs:
+            self._append("tactile_hydro_marker", obs["tactile_hydro_marker"])
+        if "tactile_hydro_marker_shear" in obs:
+            self._append("tactile_hydro_marker_shear", obs["tactile_hydro_marker_shear"])
         self._append("joint_pos", obs["joint_pos"])
         self._append("joint_vel", obs["joint_vel"])
         self._append("plug_pose", obs["plug_pose"])
@@ -392,8 +411,8 @@ def create_viser_server(port: int, cfg=None):
 
     if cfg is not None and hasattr(server, "initial_camera"):
         try:
-            eye = np.asarray(getattr(cfg, "camera_eye"), dtype=np.float64).reshape(3)
-            target = np.asarray(getattr(cfg, "camera_target"), dtype=np.float64).reshape(3)
+            eye = np.asarray(cfg.camera.eye, dtype=np.float64).reshape(3)
+            target = np.asarray(cfg.camera.target, dtype=np.float64).reshape(3)
             server.initial_camera.position = eye
             server.initial_camera.look_at = target
             server.initial_camera.up = np.array([0.0, 0.0, 1.0], dtype=np.float64)
@@ -449,17 +468,64 @@ def create_viser_server(port: int, cfg=None):
         record_btn.name = "Start Recording" if is_recording else "Stop Recording"
         record_btn.color = "green" if is_recording else "orange"
 
+    hydro_enabled = getattr(cfg.tactile, "enable_hydro_normal_observation", False)
+    main_shear_enabled = bool(getattr(cfg.tactile.backend, "include_force_observations", False))
     dummy_img = np.zeros((96, 256, 3), dtype=np.uint8)
-    with server.gui.add_folder("Tactile"):
+    pad_labels = [
+        "Left arm / left finger",
+        "Left arm / right finger",
+        "Right arm / left finger",
+        "Right arm / right finger",
+    ]
+    with server.gui.add_folder("Tactile Normal"):
         tac_handles = [
             server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
-            for label in [
-                "Left arm / left finger",
-                "Left arm / right finger",
-                "Right arm / left finger",
-                "Right arm / right finger",
-            ]
+            for label in pad_labels
         ]
+    hydro_handles = []
+    main_shear_x_handles = []
+    main_shear_y_handles = []
+    main_shear_mag_handles = []
+    hydro_shear_x_handles = []
+    hydro_shear_y_handles = []
+    hydro_shear_mag_handles = []
+    if main_shear_enabled:
+        with server.gui.add_folder("Main Shear X"):
+            main_shear_x_handles = [
+                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
+                for label in pad_labels
+            ]
+        with server.gui.add_folder("Main Shear Y"):
+            main_shear_y_handles = [
+                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
+                for label in pad_labels
+            ]
+        with server.gui.add_folder("Main Shear Magnitude"):
+            main_shear_mag_handles = [
+                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
+                for label in pad_labels
+            ]
+    if hydro_enabled:
+        with server.gui.add_folder("Hydro Normal"):
+            hydro_handles = [
+                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
+                for label in pad_labels
+            ]
+        with server.gui.add_folder("Hydro Shear X"):
+            hydro_shear_x_handles = [
+                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
+                for label in pad_labels
+            ]
+        with server.gui.add_folder("Hydro Shear Y"):
+            hydro_shear_y_handles = [
+                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
+                for label in pad_labels
+            ]
+        with server.gui.add_folder("Hydro Shear Magnitude"):
+            hydro_shear_mag_handles = [
+                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
+                for label in pad_labels
+            ]
 
     with server.gui.add_folder("State", expand_by_default=False):
         state_md = server.gui.add_markdown("**Loading...**")
@@ -483,6 +549,13 @@ def create_viser_server(port: int, cfg=None):
         "right_gripper_slider": right_slider,
         "record_btn": record_btn,
         "tac_handles": tac_handles,
+        "hydro_handles": hydro_handles,
+        "main_shear_x_handles": main_shear_x_handles,
+        "main_shear_y_handles": main_shear_y_handles,
+        "main_shear_mag_handles": main_shear_mag_handles,
+        "hydro_shear_x_handles": hydro_shear_x_handles,
+        "hydro_shear_y_handles": hydro_shear_y_handles,
+        "hydro_shear_mag_handles": hydro_shear_mag_handles,
         "state_md": state_md,
         "camera_img": camera_img,
     }
@@ -492,7 +565,10 @@ def create_viser_server(port: int, cfg=None):
 def load_scene_objects(server, handles, cfg):
     from viser.extras import ViserUrdf
 
-    urdf_path = Path(os.path.expanduser(cfg.urdf_path))
+    robot_cfg = cfg.robot
+    objects_cfg = cfg.objects
+
+    urdf_path = Path(os.path.expanduser(robot_cfg.urdf_path))
     print(f"[viser] Loading URDF from {urdf_path}...", flush=True)
     try:
         viser_urdf = ViserUrdf(
@@ -507,13 +583,13 @@ def load_scene_objects(server, handles, cfg):
     except Exception as e:
         print(f"[viser] WARNING: URDF load failed: {e}", flush=True)
 
-    asset_root = os.path.expanduser(getattr(cfg, "asset_root", ""))
+    asset_root = os.path.expanduser(objects_cfg.asset_root)
     automate_dir = os.path.join(asset_root, "automate_scaled", "urdf")
 
-    if cfg.enable_plug:
+    if objects_cfg.enable_plug:
         import trimesh
 
-        plug_urdf = os.path.join(automate_dir, f"{cfg.automate_asset_id}_plug.urdf")
+        plug_urdf = os.path.join(automate_dir, f"{objects_cfg.automate_asset_id}_plug.urdf")
         try:
             result = _extract_mesh_path_from_urdf(plug_urdf)
             if result:
@@ -530,10 +606,10 @@ def load_scene_objects(server, handles, cfg):
         except Exception as e:
             print(f"[viser] WARNING: Plug mesh load failed: {e}", flush=True)
 
-    if cfg.enable_socket:
+    if objects_cfg.enable_socket:
         import trimesh
 
-        socket_urdf = os.path.join(automate_dir, f"{cfg.automate_asset_id}_socket.urdf")
+        socket_urdf = os.path.join(automate_dir, f"{objects_cfg.automate_asset_id}_socket.urdf")
         try:
             result = _extract_mesh_path_from_urdf(socket_urdf)
             if result:
@@ -615,14 +691,121 @@ def update_scene_fast(handles, obs, left_ee_pos, left_ee_quat, right_ee_pos, rig
 
 def update_scene_slow(handles, obs, left_ee, right_ee, left_gripper, right_gripper, step, recording, rec_steps):
     tactile = obs["tactile"]
+    if args.tactile_backend == "surface_hydro":
+        tactile_shear = tactile_shear_uv(obs.get("tactile_marker_shear"))
+        if tactile_shear is None:
+            tactile_shear = tactile_shear_uv(obs.get("tactile_shear"))
+    else:
+        tactile_shear = tactile_shear_uv(obs.get("tactile_shear"))
+        if tactile_shear is None:
+            tactile_shear = tactile_shear_uv(obs.get("tactile_marker_shear"))
+    tactile_hydro = obs.get("tactile_hydro")
+    tactile_hydro_shear = tactile_shear_uv(obs.get("tactile_hydro_marker_shear"))
+    if tactile_hydro_shear is None:
+        tactile_hydro_shear = tactile_shear_uv(obs.get("tactile_hydro_shear"))
     tac_maxes = []
+    main_shear_x_ranges = []
+    main_shear_y_ranges = []
+    main_shear_mag_maxes = []
+    hydro_maxes = []
+    shear_x_ranges = []
+    shear_y_ranges = []
+    shear_mag_maxes = []
     for i, handle in enumerate(handles["tac_handles"]):
         grid = tactile[i]
-        tac_maxes.append(float(grid.max()))
+        grid_normal = tactile_normal_channel(grid)
+        tac_maxes.append(float(grid_normal.max()))
+        main_shear_grid = tactile_shear[i] if tactile_shear is not None else None
+        if main_shear_grid is not None:
+            sx = main_shear_grid[:, :, 0]
+            sy = main_shear_grid[:, :, 1]
+            mag = np.linalg.norm(main_shear_grid, axis=-1)
+            main_shear_x_ranges.append((float(sx.min()), float(sx.max())))
+            main_shear_y_ranges.append((float(sy.min()), float(sy.max())))
+            main_shear_mag_maxes.append(float(mag.max()))
+        hydro_grid = tactile_hydro[i] if tactile_hydro is not None else None
+        if hydro_grid is not None:
+            hydro_normal = tactile_normal_channel(hydro_grid)
+            hydro_maxes.append(float(hydro_normal.max()))
+        shear_grid = tactile_hydro_shear[i] if tactile_hydro_shear is not None else None
+        if shear_grid is not None:
+            sx = shear_grid[:, :, 0]
+            sy = shear_grid[:, :, 1]
+            mag = np.linalg.norm(shear_grid, axis=-1)
+            shear_x_ranges.append((float(sx.min()), float(sx.max())))
+            shear_y_ranges.append((float(sy.min()), float(sy.max())))
+            shear_mag_maxes.append(float(mag.max()))
         try:
-            handle.image = tactile_to_rgb(grid)
+            handle.image = _label_rgb(tactile_to_rgb(grid_normal), f"orig max={_fmt_scalar(float(grid_normal.max()))}")
         except Exception:
             pass
+        if main_shear_grid is not None:
+            sx = main_shear_grid[:, :, 0]
+            sy = main_shear_grid[:, :, 1]
+            mag = np.linalg.norm(main_shear_grid, axis=-1)
+            signed_vmax = max(float(np.max(np.abs(sx))), float(np.max(np.abs(sy))), 1.0e-8)
+            if i < len(handles.get("main_shear_x_handles", [])):
+                try:
+                    handles["main_shear_x_handles"][i].image = _label_rgb(
+                        signed_tactile_to_rgb(sx, vmax=signed_vmax),
+                        f"x min {_fmt_scalar(float(sx.min()))}\nx max {_fmt_scalar(float(sx.max()))}",
+                    )
+                except Exception:
+                    pass
+            if i < len(handles.get("main_shear_y_handles", [])):
+                try:
+                    handles["main_shear_y_handles"][i].image = _label_rgb(
+                        signed_tactile_to_rgb(sy, vmax=signed_vmax),
+                        f"y min {_fmt_scalar(float(sy.min()))}\ny max {_fmt_scalar(float(sy.max()))}",
+                    )
+                except Exception:
+                    pass
+            if i < len(handles.get("main_shear_mag_handles", [])):
+                try:
+                    handles["main_shear_mag_handles"][i].image = _label_rgb(
+                        tactile_to_rgb(mag),
+                        f"|s| max={_fmt_scalar(float(mag.max()))}",
+                    )
+                except Exception:
+                    pass
+        if hydro_grid is not None and i < len(handles.get("hydro_handles", [])):
+            hydro_normal = tactile_normal_channel(hydro_grid)
+            try:
+                handles["hydro_handles"][i].image = _label_rgb(
+                    tactile_to_rgb(hydro_normal),
+                    f"hydro max={_fmt_scalar(float(hydro_normal.max()))}",
+                )
+            except Exception:
+                pass
+        if shear_grid is not None:
+            sx = shear_grid[:, :, 0]
+            sy = shear_grid[:, :, 1]
+            mag = np.linalg.norm(shear_grid, axis=-1)
+            signed_vmax = max(float(np.max(np.abs(sx))), float(np.max(np.abs(sy))), 1.0e-8)
+            if i < len(handles.get("hydro_shear_x_handles", [])):
+                try:
+                    handles["hydro_shear_x_handles"][i].image = _label_rgb(
+                        signed_tactile_to_rgb(sx, vmax=signed_vmax),
+                        f"x min {_fmt_scalar(float(sx.min()))}\nx max {_fmt_scalar(float(sx.max()))}",
+                    )
+                except Exception:
+                    pass
+            if i < len(handles.get("hydro_shear_y_handles", [])):
+                try:
+                    handles["hydro_shear_y_handles"][i].image = _label_rgb(
+                        signed_tactile_to_rgb(sy, vmax=signed_vmax),
+                        f"y min {_fmt_scalar(float(sy.min()))}\ny max {_fmt_scalar(float(sy.max()))}",
+                    )
+                except Exception:
+                    pass
+            if i < len(handles.get("hydro_shear_mag_handles", [])):
+                try:
+                    handles["hydro_shear_mag_handles"][i].image = _label_rgb(
+                        tactile_to_rgb(mag),
+                        f"|s| max={_fmt_scalar(float(mag.max()))}",
+                    )
+                except Exception:
+                    pass
 
     if "rgb" in obs:
         try:
@@ -631,13 +814,71 @@ def update_scene_slow(handles, obs, left_ee, right_ee, left_gripper, right_gripp
             pass
 
     rec_status = f"  **REC** ({rec_steps} steps)" if recording else ""
-    tac_str = ", ".join(f"{m:.4f}" for m in tac_maxes)
+    tac_str = ", ".join(_fmt_scalar(m) for m in tac_maxes)
+    main_sx_str = (
+        ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in main_shear_x_ranges)
+        if main_shear_x_ranges
+        else "disabled"
+    )
+    main_sy_str = (
+        ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in main_shear_y_ranges)
+        if main_shear_y_ranges
+        else "disabled"
+    )
+    main_smag_str = (
+        ", ".join(_fmt_scalar(m) for m in main_shear_mag_maxes) if main_shear_mag_maxes else "disabled"
+    )
+    if hydro_maxes:
+        hydro_str = ", ".join(_fmt_scalar(m) for m in hydro_maxes)
+        sx_str = (
+            ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in shear_x_ranges)
+            if shear_x_ranges
+            else "disabled"
+        )
+        sy_str = (
+            ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in shear_y_ranges)
+            if shear_y_ranges
+            else "disabled"
+        )
+        smag_str = ", ".join(_fmt_scalar(m) for m in shear_mag_maxes) if shear_mag_maxes else "disabled"
+        normal_table = (
+            "| Pad | Orig normal max | Hydro normal max | Hydro shear-x min/max | Hydro shear-y min/max | Hydro \\|shear\\| max |\n"
+            "| --- | ---: | ---: | ---: | ---: | ---: |\n"
+            + "\n".join(
+                f"| {label} | {_fmt_scalar(orig)} | {_fmt_scalar(hydro)} | "
+                f"[{_fmt_scalar(sx[0])},{_fmt_scalar(sx[1])}] | "
+                f"[{_fmt_scalar(sy[0])},{_fmt_scalar(sy[1])}] | {_fmt_scalar(smag)} |"
+                for label, orig, hydro, sx, sy, smag in zip(
+                    ("L-L", "L-R", "R-L", "R-R"),
+                    tac_maxes,
+                    hydro_maxes,
+                    shear_x_ranges or [(0.0, 0.0)] * len(hydro_maxes),
+                    shear_y_ranges or [(0.0, 0.0)] * len(hydro_maxes),
+                    shear_mag_maxes or [0.0] * len(hydro_maxes),
+                    strict=False,
+                )
+            )
+        )
+    else:
+        hydro_str = "disabled"
+        sx_str = "disabled"
+        sy_str = "disabled"
+        smag_str = "disabled"
+        normal_table = ""
     handles["state_md"].content = (
         f"**Left EE:** ({left_ee[0]:.4f}, {left_ee[1]:.4f}, {left_ee[2]:.4f})  \n"
         f"**Right EE:** ({right_ee[0]:.4f}, {right_ee[1]:.4f}, {right_ee[2]:.4f})  \n"
         f"**Left gripper:** {left_gripper:.2f}  \n"
         f"**Right gripper:** {right_gripper:.2f}  \n"
         f"**Tactile max [4 pads]:** [{tac_str}]  \n"
+        f"**Main shear-x min/max [4 pads]:** [{main_sx_str}]  \n"
+        f"**Main shear-y min/max [4 pads]:** [{main_sy_str}]  \n"
+        f"**Main |shear| max [4 pads]:** [{main_smag_str}]  \n"
+        f"**Hydro normal max [4 pads]:** [{hydro_str}]  \n"
+        f"**Hydro shear-x min/max [4 pads]:** [{sx_str}]  \n"
+        f"**Hydro shear-y min/max [4 pads]:** [{sy_str}]  \n"
+        f"**Hydro |shear| max [4 pads]:** [{smag_str}]  \n"
+        f"{normal_table}\n"
         f"**Step:** {step}{rec_status}"
     )
 
@@ -700,33 +941,38 @@ def main():
     port = int(args.port)
 
     cfg = AlohaTactileEnvCfg(
-        headless=bool(getattr(args, "headless", True)),
-        device=str(getattr(args, "device", "cuda:0")),
-        enable_camera=True,
+        camera=AlohaCameraCfg(enable_camera=True),
+        sim=AlohaSimCfg(
+            headless=bool(getattr(args, "headless", True)),
+            device=str(getattr(args, "device", "cuda:0")),
+        ),
     )
+    if args.tactile_backend == "taxel_shear":
+        cfg.tactile.backend = TaxelShearTactileBackendCfg()
+    elif args.tactile_backend == "surface_hydro":
+        cfg.tactile.backend = HydroShearTactileBackendCfg(include_force_observations=True)
+    cfg.tactile.enable_hydro_normal_observation = bool(args.compare_hydro_normal)
+    cfg.tactile.hydro_normal_backend.include_force_observations = bool(args.compare_hydro_normal)
+    cfg.tactile.hydro_normal_backend.normal_readout_scale = float(args.hydro_normal_scale)
+    cfg.tactile.hydro_normal_backend.shear_readout_scale = float(args.hydro_shear_scale)
+    if args.hydro_shear_stiffness is not None:
+        cfg.tactile.hydro_normal_backend.shear_stiffness = float(args.hydro_shear_stiffness)
 
-    if not cfg.headless:
+    if not cfg.sim.headless:
         try:
             from isaacsim.core.utils.viewports import set_camera_view
-            set_camera_view(list(cfg.camera_eye), list(cfg.camera_target))
+            set_camera_view(list(cfg.camera.eye), list(cfg.camera.target))
         except Exception as e:
             print(f"[WARN] Failed to set viewport camera view: {e}", flush=True)
 
     server, handles = create_viser_server(port, cfg)
 
-    cfg = AlohaTactileEnvCfg(
-        headless=bool(getattr(args, "headless", True)),
-        device=str(getattr(args, "device", "cuda:0")),
-        enable_camera=True,
-    )
-
     handles["state_md"].content = "**Loading Isaac Sim environment...**"
-    patch_env_spawn_objects_for_socket_articulation_fix()
     env = AlohaTactileEnv(cfg, simulation_app=simulation_app)
     obs, _ = env.reset()
 
-    left_ik = AlohaArmIKController(robot=env._robot, device=cfg.device, arm="left")
-    right_ik = AlohaArmIKController(robot=env._robot, device=cfg.device, arm="right")
+    left_ik = AlohaArmIKController(robot=env._robot, device=cfg.sim.device, arm="left")
+    right_ik = AlohaArmIKController(robot=env._robot, device=cfg.sim.device, arm="right")
     upgrade_ik_to_pose_mode(left_ik)
     upgrade_ik_to_pose_mode(right_ik)
 

@@ -97,7 +97,7 @@ pip install viser
 
 ## 🖥️ Replay a Recorded Trajectory
 
-Launch the tactile replay viewer with a saved dataset episode:
+Launch the tactile replay viewer with the default WarpSDF normal tactile backend:
 
 ```bash
 ./isaaclab.sh -p Isaacsim_tactile_env/reply_with_tactile.py \
@@ -108,15 +108,53 @@ Launch the tactile replay viewer with a saved dataset episode:
     --steps_per_frame 3
 ```
 
+Run the same replay with the surface-point HydroShear backend:
+
+```bash
+./isaaclab.sh -p Isaacsim_tactile_env/reply_with_tactile.py \
+    --dataset_npz Isaacsim_tactile_env/data/dataset_train.npz \
+    --normalization_pth Isaacsim_tactile_env/data/dataset_normalizer.npz \
+    --episode_idx 3 \
+    --replay_key joint_states \
+    --steps_per_frame 3 \
+    --tactile_backend surface_hydro
+```
+
+Replay options:
+
+- `--tactile_backend normal`: use the original WarpSDF normal-force tactile grid.
+- `--tactile_backend taxel_shear`: use WarpSDF normal force plus a taxel-level shear baseline.
+- `--tactile_backend surface_hydro`: use the surface-point HydroShear marker-field backend.
+- `--compare_hydro_normal`: additionally show a HydroShear output beside the selected main tactile backend.
+
 ## 🦾 Launch the Interactive Web Interface
 
-Start the Viser-based teleoperation interface:
+Start the Viser-based teleoperation interface with the default WarpSDF normal tactile backend:
 
 ```bash
 ./isaaclab.sh -p Isaacsim_tactile_env/viser_interface.py \
     --headless \
     --enable_cameras
 ```
+
+Start Viser with the surface-point HydroShear tactile backend:
+
+```bash
+./isaaclab.sh -p Isaacsim_tactile_env/viser_interface.py \
+    --headless \
+    --enable_cameras \
+    --tactile_backend surface_hydro
+```
+
+Viser options:
+
+- `--tactile_backend normal`: use the original WarpSDF normal-force tactile grid.
+- `--tactile_backend taxel_shear`: use WarpSDF normal force plus a taxel-level shear baseline.
+- `--tactile_backend surface_hydro`: use the surface-point HydroShear marker-field backend.
+- `--compare_hydro_normal`: add a separate HydroShear comparison panel.
+- `--hydro_normal_scale`: scale the HydroShear normal channel in comparison mode.
+- `--hydro_shear_scale`: scale the HydroShear shear channels in comparison mode.
+- `--hydro_shear_stiffness`: override the HydroShear tangential stiffness in comparison mode.
 
 Then open the following in your browser:
 

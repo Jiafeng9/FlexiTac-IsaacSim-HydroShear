@@ -37,6 +37,17 @@ parser.add_argument("--replay_key", type=str, default="joint_states", choices=("
 parser.add_argument("--steps_per_frame", type=int, default=3)
 parser.add_argument("--max_steps", type=int, default=-1)
 parser.add_argument("--tactile_scale", type=int, default=8)
+parser.add_argument(
+    "--compare_hydro_normal",
+    action="store_true",
+    help="Show original WarpSDF normal, HydroShear normal, and HydroShear shear x/y.",
+)
+parser.add_argument(
+    "--tactile_backend",
+    choices=("normal", "taxel_shear", "surface_hydro"),
+    default="normal",
+    help="Main tactile backend: original normal, taxel-level shear, or surface-point HydroShear.",
+)
 
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -46,10 +57,30 @@ simulation_app = app_launcher.app
 
 # --- Now safe to import env ---
 sys.path.insert(0, str(Path(__file__).parent))
-from aloha_tactile_env import AlohaTactileEnv, AlohaTactileEnvCfg  # noqa: E402
+from aloha.camera import AlohaCameraCfg  # noqa: E402
+from aloha.cfg import AlohaTactileEnvCfg  # noqa: E402
+from aloha.env import AlohaTactileEnv  # noqa: E402
+from aloha.scene import AlohaSimCfg  # noqa: E402
+from aloha.tactile import HydroShearTactileBackendCfg, TaxelShearTactileBackendCfg  # noqa: E402
 
 
 SENSOR_LABELS = ["L-L", "L-R", "R-L", "R-R"]
+
+
+def tactile_normal_channel(grid: np.ndarray) -> np.ndarray:
+    grid = np.asarray(grid)
+    if grid.ndim >= 3 and grid.shape[-1] == 3:
+        return grid[..., 0]
+    return grid
+
+
+def tactile_shear_uv(grid: np.ndarray | None) -> np.ndarray | None:
+    if grid is None:
+        return None
+    grid = np.asarray(grid)
+    if grid.ndim >= 3 and grid.shape[-1] == 3:
+        return grid[..., 1:3]
+    return grid
 
 
 # -----------------------------
@@ -95,17 +126,22 @@ def show_image(name: str, img_bgr: np.ndarray) -> None:
     """Show image with OpenCV HighGUI (no dump)."""
     if img_bgr is None:
         return
+    if bool(getattr(args, "headless", False)) or not os.environ.get("DISPLAY"):
+        return
     if img_bgr.dtype != np.uint8:
         img_bgr = np.clip(img_bgr, 0, 255).astype(np.uint8)
 
-    cv2.imshow(name, img_bgr)
-    cv2.waitKey(1)  
+    try:
+        cv2.imshow(name, img_bgr)
+        cv2.waitKey(1)
+    except cv2.error:
+        pass
 
 def tactile_strip(tactile: np.ndarray, *, scale: int, labels: list[str]) -> np.ndarray:
-    """tactile: (4,H,W) -> BGR strip"""
+    """tactile: (4,H,W) normal or (4,H,W,3) marker field -> BGR strip."""
     imgs = []
     for i in range(min(4, tactile.shape[0])):
-        grid = tactile[i]
+        grid = tactile_normal_channel(tactile[i])
         vmax = float(grid.max())
         norm = (grid / (vmax + 1e-8)) if vmax > 0 else np.zeros_like(grid)
         u8 = (norm * 255.0).astype(np.uint8)
@@ -126,6 +162,112 @@ def tactile_strip(tactile: np.ndarray, *, scale: int, labels: list[str]) -> np.n
     return np.concatenate(imgs, axis=1) if imgs else np.zeros((1, 1, 3), dtype=np.uint8)
 
 
+def tactile_grid_to_bgr(grid: np.ndarray, *, scale: int, vmax: float | None = None) -> np.ndarray:
+    grid = tactile_normal_channel(grid)
+    vmax = float(grid.max()) if vmax is None else float(vmax)
+    norm = (grid / (vmax + 1e-8)) if vmax > 0 else np.zeros_like(grid)
+    u8 = (norm * 255.0).astype(np.uint8)
+    bgr = cv2.applyColorMap(u8, cv2.COLORMAP_JET)
+    if scale != 1:
+        bgr = cv2.resize(bgr, (bgr.shape[1] * scale, bgr.shape[0] * scale), interpolation=cv2.INTER_NEAREST)
+    return bgr
+
+
+def signed_grid_to_bgr(grid: np.ndarray, *, scale: int, vmax: float | None = None) -> np.ndarray:
+    vmax = float(np.max(np.abs(grid))) if vmax is None else float(vmax)
+    if vmax <= 0.0:
+        bgr = np.full(grid.shape + (3,), 255, dtype=np.uint8)
+    else:
+        signed = np.clip(grid / (vmax + 1e-8), -1.0, 1.0)
+        mag = np.abs(signed)
+        base = (255.0 * (1.0 - mag)).astype(np.uint8)
+        bgr = np.empty(grid.shape + (3,), dtype=np.uint8)
+        positive = signed >= 0.0
+        bgr[..., 0] = np.where(positive, base, 255)
+        bgr[..., 1] = base
+        bgr[..., 2] = np.where(positive, 255, base)
+    if scale != 1:
+        bgr = cv2.resize(bgr, (bgr.shape[1] * scale, bgr.shape[0] * scale), interpolation=cv2.INTER_NEAREST)
+    return bgr
+
+
+def fmt_scalar(value: float) -> str:
+    value = float(value)
+    if 0.0 < abs(value) < 1.0e-3 or abs(value) >= 1.0e4:
+        return f"{value:.3e}"
+    return f"{value:.4f}"
+
+
+def normal_compare_strip(original: np.ndarray, hydro: np.ndarray, *, scale: int, labels: list[str]) -> np.ndarray:
+    """Return a two-column image: original normal | HydroShear normal."""
+    rows = []
+    for i in range(min(4, original.shape[0], hydro.shape[0])):
+        orig = tactile_normal_channel(original[i])
+        hyd = tactile_normal_channel(hydro[i])
+        orig_max = float(orig.max())
+        hyd_max = float(hyd.max())
+        orig_img = tactile_grid_to_bgr(orig, scale=scale, vmax=max(orig_max, 1.0e-8))
+        hyd_img = tactile_grid_to_bgr(hyd, scale=scale, vmax=max(hyd_max, 1.0e-8))
+        cv2.putText(
+            orig_img,
+            f"{labels[i]} orig max={fmt_scalar(orig_max)}",
+            (5, 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            hyd_img,
+            f"{labels[i]} hydro max={fmt_scalar(hyd_max)}",
+            (5, 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+        rows.append(np.concatenate((orig_img, hyd_img), axis=1))
+    return np.concatenate(rows, axis=0) if rows else np.zeros((1, 1, 3), dtype=np.uint8)
+
+
+def shear_xy_strip(tactile_shear: np.ndarray, *, scale: int, labels: list[str], title: str) -> np.ndarray:
+    """Return a two-column signed image: shear-x | shear-y."""
+    rows = []
+    tactile_shear = tactile_shear_uv(tactile_shear)
+    if tactile_shear is None:
+        return np.zeros((1, 1, 3), dtype=np.uint8)
+    for i in range(min(4, tactile_shear.shape[0])):
+        sx = tactile_shear[i, :, :, 0]
+        sy = tactile_shear[i, :, :, 1]
+        signed_vmax = max(float(np.max(np.abs(sx))), float(np.max(np.abs(sy))), 1.0e-8)
+        sx_img = signed_grid_to_bgr(sx, scale=scale, vmax=signed_vmax)
+        sy_img = signed_grid_to_bgr(sy, scale=scale, vmax=signed_vmax)
+        cv2.putText(
+            sx_img,
+            f"{labels[i]} {title} x absmax={fmt_scalar(float(np.max(np.abs(sx))))}",
+            (5, 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            sy_img,
+            f"{labels[i]} {title} y absmax={fmt_scalar(float(np.max(np.abs(sy))))}",
+            (5, 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+        rows.append(np.concatenate((sx_img, sy_img), axis=1))
+    return np.concatenate(rows, axis=0) if rows else np.zeros((1, 1, 3), dtype=np.uint8)
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -143,15 +285,26 @@ def main():
 
     # env config: keep minimal + match AppLauncher flags
     cfg = AlohaTactileEnvCfg(
-        headless=bool(getattr(args, "headless", True)),
-        device=str(getattr(args, "device", "cuda:0")),
-        enable_camera=bool(getattr(args, "enable_cameras", False)),
+        camera=AlohaCameraCfg(enable_camera=bool(getattr(args, "enable_cameras", False))),
+        sim=AlohaSimCfg(
+            headless=bool(getattr(args, "headless", True)),
+            device=str(getattr(args, "device", "cuda:0")),
+        ),
     )
+    if args.tactile_backend == "taxel_shear":
+        cfg.tactile.backend = TaxelShearTactileBackendCfg()
+    elif args.tactile_backend == "surface_hydro":
+        cfg.tactile.backend = HydroShearTactileBackendCfg(include_force_observations=True)
+    cfg.tactile.enable_hydro_normal_observation = bool(args.compare_hydro_normal)
+    cfg.tactile.hydro_normal_backend.include_force_observations = bool(args.compare_hydro_normal)
+    if args.compare_hydro_normal:
+        cfg.tactile.hydro_normal_backend.normal_readout_scale = 1.0
+        cfg.tactile.hydro_normal_backend.shear_readout_scale = 1.0
 
-    if not cfg.headless:
+    if not cfg.sim.headless:
         try:
             from isaacsim.core.utils.viewports import set_camera_view
-            set_camera_view(list(cfg.camera_eye), list(cfg.camera_target))
+            set_camera_view(list(cfg.camera.eye), list(cfg.camera.target))
         except Exception as e:
             print(f"[WARN] Failed to set viewport camera view: {e}")
 
@@ -176,12 +329,72 @@ def main():
             action[15] += 0.005
 
         obs, *_ = env.step(action)
-        tactile = obs["tactile"]  # (4,H,W)
-        vis = tactile_strip(tactile, scale=int(args.tactile_scale), labels=SENSOR_LABELS)
-        show_image("Tactile", vis)
+        tactile = obs["tactile"]
+        if args.tactile_backend == "surface_hydro":
+            tactile_shear = tactile_shear_uv(obs.get("tactile_marker_shear"))
+            if tactile_shear is None:
+                tactile_shear = tactile_shear_uv(obs.get("tactile_shear"))
+        else:
+            tactile_shear = tactile_shear_uv(obs.get("tactile_shear"))
+            if tactile_shear is None:
+                tactile_shear = tactile_shear_uv(obs.get("tactile_marker_shear"))
+        tactile_slip = obs.get("tactile_slip_ratio")
+        tactile_hydro = obs.get("tactile_hydro")
+        tactile_hydro_shear = tactile_shear_uv(obs.get("tactile_hydro_marker_shear"))
+        if tactile_hydro_shear is None:
+            tactile_hydro_shear = tactile_shear_uv(obs.get("tactile_hydro_shear"))
+        tactile_normal = tactile_normal_channel(tactile)
+        tactile_hydro_normal = tactile_normal_channel(tactile_hydro) if tactile_hydro is not None else None
+        if tactile_hydro is not None:
+            vis = normal_compare_strip(tactile, tactile_hydro, scale=int(args.tactile_scale), labels=SENSOR_LABELS)
+            show_image("Tactile Normal: Original | Hydro", vis)
+            if tactile_hydro_shear is not None:
+                shear_vis = shear_xy_strip(
+                    tactile_hydro_shear,
+                    scale=int(args.tactile_scale),
+                    labels=SENSOR_LABELS,
+                    title="hydro shear",
+                )
+                show_image("Hydro Shear: X | Y", shear_vis)
+        else:
+            vis = tactile_strip(tactile, scale=int(args.tactile_scale), labels=SENSOR_LABELS)
+            show_image("Tactile", vis)
+        if tactile_shear is not None:
+            shear_vis = shear_xy_strip(
+                tactile_shear,
+                scale=int(args.tactile_scale),
+                labels=SENSOR_LABELS,
+                title=f"{args.tactile_backend} shear",
+            )
+            show_image("Main Tactile Shear: X | Y", shear_vis)
 
         if step % 30 == 0:
-            print(f"[step {step:06d}] traj_idx={traj_idx:4d} tactile_max={float(tactile.max()):.4f}")
+            if tactile_hydro is None:
+                shear_msg = ""
+                if tactile_shear is not None:
+                    shear_msg = (
+                        f" shear_x_absmax={fmt_scalar(float(np.max(np.abs(tactile_shear[..., 0]))))}"
+                        f" shear_y_absmax={fmt_scalar(float(np.max(np.abs(tactile_shear[..., 1]))))}"
+                    )
+                    if tactile_slip is not None:
+                        shear_msg += f" slip_max={fmt_scalar(float(np.max(tactile_slip)))}"
+                print(
+                    f"[step {step:06d}] traj_idx={traj_idx:4d} "
+                    f"tactile_max={float(tactile_normal.max()):.4f}{shear_msg}"
+                )
+            else:
+                shear_msg = ""
+                if tactile_hydro_shear is not None:
+                    shear_msg = (
+                        f" hydro_shear_x_absmax={fmt_scalar(float(np.max(np.abs(tactile_hydro_shear[..., 0]))))}"
+                        f" hydro_shear_y_absmax={fmt_scalar(float(np.max(np.abs(tactile_hydro_shear[..., 1]))))}"
+                    )
+                print(
+                    f"[step {step:06d}] traj_idx={traj_idx:4d} "
+                    f"orig_normal_max={fmt_scalar(float(tactile_normal.max()))} "
+                    f"hydro_normal_max={fmt_scalar(float(tactile_hydro_normal.max()))}"
+                    f"{shear_msg}"
+                )
 
     env.close()
     simulation_app.close()
