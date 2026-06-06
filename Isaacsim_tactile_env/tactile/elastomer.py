@@ -9,6 +9,8 @@ import torch
 class ElastomerSdfResult:
     points_p: torch.Tensor
     sdf: torch.Tensor
+    closest_points_p: torch.Tensor | None = None
+    normals_p: torch.Tensor | None = None
 
 
 @dataclass
@@ -52,7 +54,9 @@ class FlatPatchElastomerSdf:
             outside_v = points_p[..., axis_v].abs() - float(self.cfg.half_extent_v)
             outside = torch.maximum(outside_u, outside_v)
             sdf = torch.where(outside > 0.0, outside.clamp_min(float(self.cfg.eps)), sdf)
-        return ElastomerSdfResult(points_p=points_p, sdf=sdf)
+        normals_p = torch.zeros_like(points_p)
+        normals_p[..., self.cfg.normal_axis] = 1.0
+        return ElastomerSdfResult(points_p=points_p, sdf=sdf, normals_p=normals_p)
 
 
 class MeshPatchElastomerSdf:
@@ -86,8 +90,13 @@ class MeshPatchElastomerSdf:
 
         vertices_p = self.vertices_p.to(device=points_p.device, dtype=points_p.dtype)
         faces = self.faces.to(device=points_p.device)
-        sdf = signed_distance_to_mesh(points_p, vertices_p, faces, chunk_size=self.chunk_size).sdf
-        return ElastomerSdfResult(points_p=points_p, sdf=sdf)
+        out = signed_distance_to_mesh(points_p, vertices_p, faces, chunk_size=self.chunk_size)
+        return ElastomerSdfResult(
+            points_p=points_p,
+            sdf=out.sdf,
+            closest_points_p=out.closest_points_o,
+            normals_p=out.closest_normals_o,
+        )
 
 
 def normalize_quat_wxyz(quat: torch.Tensor, eps: float = 1.0e-12) -> torch.Tensor:

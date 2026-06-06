@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import site
 import sys
 import threading
 import xml.etree.ElementTree as ET
@@ -49,6 +50,28 @@ parser.add_argument(
 )
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
+
+
+def _preload_viser_websockets() -> None:
+    """Keep Isaac/Kit packages from shadowing the conda websockets package used by Viser."""
+
+    for site_dir in reversed(site.getsitepackages()):
+        if site_dir in sys.path:
+            sys.path.remove(site_dir)
+        sys.path.insert(0, site_dir)
+
+    try:
+        import websockets.asyncio.server  # noqa: F401
+    except ModuleNotFoundError as e:
+        if str(getattr(e, "name", "")).startswith("websockets"):
+            raise ModuleNotFoundError(
+                "Viser requires websockets.asyncio.server. Install a compatible version with: "
+                'pip install -U "websockets>=13"'
+            ) from e
+        raise
+
+
+_preload_viser_websockets()
 
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
@@ -100,6 +123,15 @@ def tactile_shear_uv(grid: np.ndarray | None) -> np.ndarray | None:
     if grid.ndim >= 3 and grid.shape[-1] == 3:
         return grid[..., 1:3]
     return grid
+
+
+def tactile_marker_vector_uv(grid: np.ndarray | None) -> np.ndarray | None:
+    if grid is None:
+        return None
+    grid = np.asarray(grid)
+    if grid.ndim >= 3 and grid.shape[-1] == 3:
+        return grid[..., 1:3]
+    return None
 
 
 def signed_tactile_to_rgb(grid: np.ndarray, scale: int = 8, vmax: float | None = None) -> np.ndarray:
@@ -403,7 +435,15 @@ class TrajectoryRecorder:
 # ---------------------------------------------------------------------------
 
 def create_viser_server(port: int, cfg=None):
-    import viser
+    try:
+        import viser
+    except ModuleNotFoundError as e:
+        if str(getattr(e, "name", "")).startswith("websockets"):
+            raise ModuleNotFoundError(
+                "Viser requires websockets.asyncio.server. Install a compatible version with: "
+                'pip install -U "websockets>=13"'
+            ) from e
+        raise
 
     print(f"[viser] Creating ViserServer on port {port}...", flush=True)
     server = viser.ViserServer(port=port)
@@ -489,19 +529,55 @@ def create_viser_server(port: int, cfg=None):
     hydro_shear_x_handles = []
     hydro_shear_y_handles = []
     hydro_shear_mag_handles = []
+    marker_shear_x_handles = []
+    marker_shear_y_handles = []
+    marker_shear_mag_handles = []
+    marker_combined_x_handles = []
+    marker_combined_y_handles = []
+    marker_combined_mag_handles = []
     if main_shear_enabled:
-        with server.gui.add_folder("Main Shear X"):
+        with server.gui.add_folder("Force Shear X"):
             main_shear_x_handles = [
                 server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
                 for label in pad_labels
             ]
-        with server.gui.add_folder("Main Shear Y"):
+        with server.gui.add_folder("Force Shear Y"):
             main_shear_y_handles = [
                 server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
                 for label in pad_labels
             ]
-        with server.gui.add_folder("Main Shear Magnitude"):
+        with server.gui.add_folder("Force Shear Magnitude"):
             main_shear_mag_handles = [
+                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
+                for label in pad_labels
+            ]
+        with server.gui.add_folder("Marker Shear X"):
+            marker_shear_x_handles = [
+                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
+                for label in pad_labels
+            ]
+        with server.gui.add_folder("Marker Shear Y"):
+            marker_shear_y_handles = [
+                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
+                for label in pad_labels
+            ]
+        with server.gui.add_folder("Marker Shear Magnitude"):
+            marker_shear_mag_handles = [
+                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
+                for label in pad_labels
+            ]
+        with server.gui.add_folder("Marker Combined X"):
+            marker_combined_x_handles = [
+                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
+                for label in pad_labels
+            ]
+        with server.gui.add_folder("Marker Combined Y"):
+            marker_combined_y_handles = [
+                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
+                for label in pad_labels
+            ]
+        with server.gui.add_folder("Marker Combined Magnitude"):
+            marker_combined_mag_handles = [
                 server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
                 for label in pad_labels
             ]
@@ -556,6 +632,12 @@ def create_viser_server(port: int, cfg=None):
         "hydro_shear_x_handles": hydro_shear_x_handles,
         "hydro_shear_y_handles": hydro_shear_y_handles,
         "hydro_shear_mag_handles": hydro_shear_mag_handles,
+        "marker_shear_x_handles": marker_shear_x_handles,
+        "marker_shear_y_handles": marker_shear_y_handles,
+        "marker_shear_mag_handles": marker_shear_mag_handles,
+        "marker_combined_x_handles": marker_combined_x_handles,
+        "marker_combined_y_handles": marker_combined_y_handles,
+        "marker_combined_mag_handles": marker_combined_mag_handles,
         "state_md": state_md,
         "camera_img": camera_img,
     }
@@ -691,14 +773,9 @@ def update_scene_fast(handles, obs, left_ee_pos, left_ee_quat, right_ee_pos, rig
 
 def update_scene_slow(handles, obs, left_ee, right_ee, left_gripper, right_gripper, step, recording, rec_steps):
     tactile = obs["tactile"]
-    if args.tactile_backend == "surface_hydro":
-        tactile_shear = tactile_shear_uv(obs.get("tactile_marker_shear"))
-        if tactile_shear is None:
-            tactile_shear = tactile_shear_uv(obs.get("tactile_shear"))
-    else:
-        tactile_shear = tactile_shear_uv(obs.get("tactile_shear"))
-        if tactile_shear is None:
-            tactile_shear = tactile_shear_uv(obs.get("tactile_marker_shear"))
+    tactile_shear = tactile_shear_uv(obs.get("tactile_shear"))
+    tactile_marker_shear = tactile_marker_vector_uv(obs.get("tactile_marker_shear"))
+    tactile_marker_combined = tactile_marker_vector_uv(obs.get("tactile_marker"))
     tactile_hydro = obs.get("tactile_hydro")
     tactile_hydro_shear = tactile_shear_uv(obs.get("tactile_hydro_marker_shear"))
     if tactile_hydro_shear is None:
@@ -707,6 +784,12 @@ def update_scene_slow(handles, obs, left_ee, right_ee, left_gripper, right_gripp
     main_shear_x_ranges = []
     main_shear_y_ranges = []
     main_shear_mag_maxes = []
+    marker_shear_x_ranges = []
+    marker_shear_y_ranges = []
+    marker_shear_mag_maxes = []
+    marker_combined_x_ranges = []
+    marker_combined_y_ranges = []
+    marker_combined_mag_maxes = []
     hydro_maxes = []
     shear_x_ranges = []
     shear_y_ranges = []
@@ -723,6 +806,22 @@ def update_scene_slow(handles, obs, left_ee, right_ee, left_gripper, right_gripp
             main_shear_x_ranges.append((float(sx.min()), float(sx.max())))
             main_shear_y_ranges.append((float(sy.min()), float(sy.max())))
             main_shear_mag_maxes.append(float(mag.max()))
+        marker_shear_grid = tactile_marker_shear[i] if tactile_marker_shear is not None else None
+        if marker_shear_grid is not None:
+            sx = marker_shear_grid[:, :, 0]
+            sy = marker_shear_grid[:, :, 1]
+            mag = np.linalg.norm(marker_shear_grid, axis=-1)
+            marker_shear_x_ranges.append((float(sx.min()), float(sx.max())))
+            marker_shear_y_ranges.append((float(sy.min()), float(sy.max())))
+            marker_shear_mag_maxes.append(float(mag.max()))
+        marker_combined_grid = tactile_marker_combined[i] if tactile_marker_combined is not None else None
+        if marker_combined_grid is not None:
+            sx = marker_combined_grid[:, :, 0]
+            sy = marker_combined_grid[:, :, 1]
+            mag = np.linalg.norm(marker_combined_grid, axis=-1)
+            marker_combined_x_ranges.append((float(sx.min()), float(sx.max())))
+            marker_combined_y_ranges.append((float(sy.min()), float(sy.max())))
+            marker_combined_mag_maxes.append(float(mag.max()))
         hydro_grid = tactile_hydro[i] if tactile_hydro is not None else None
         if hydro_grid is not None:
             hydro_normal = tactile_normal_channel(hydro_grid)
@@ -765,6 +864,64 @@ def update_scene_slow(handles, obs, left_ee, right_ee, left_gripper, right_gripp
                     handles["main_shear_mag_handles"][i].image = _label_rgb(
                         tactile_to_rgb(mag),
                         f"|s| max={_fmt_scalar(float(mag.max()))}",
+                    )
+                except Exception:
+                    pass
+        if marker_shear_grid is not None:
+            sx = marker_shear_grid[:, :, 0]
+            sy = marker_shear_grid[:, :, 1]
+            mag = np.linalg.norm(marker_shear_grid, axis=-1)
+            signed_vmax = max(float(np.max(np.abs(sx))), float(np.max(np.abs(sy))), 1.0e-8)
+            if i < len(handles.get("marker_shear_x_handles", [])):
+                try:
+                    handles["marker_shear_x_handles"][i].image = _label_rgb(
+                        signed_tactile_to_rgb(sx, vmax=signed_vmax),
+                        f"x min {_fmt_scalar(float(sx.min()))}\nx max {_fmt_scalar(float(sx.max()))}",
+                    )
+                except Exception:
+                    pass
+            if i < len(handles.get("marker_shear_y_handles", [])):
+                try:
+                    handles["marker_shear_y_handles"][i].image = _label_rgb(
+                        signed_tactile_to_rgb(sy, vmax=signed_vmax),
+                        f"y min {_fmt_scalar(float(sy.min()))}\ny max {_fmt_scalar(float(sy.max()))}",
+                    )
+                except Exception:
+                    pass
+            if i < len(handles.get("marker_shear_mag_handles", [])):
+                try:
+                    handles["marker_shear_mag_handles"][i].image = _label_rgb(
+                        tactile_to_rgb(mag),
+                        f"|s| max={_fmt_scalar(float(mag.max()))}",
+                    )
+                except Exception:
+                    pass
+        if marker_combined_grid is not None:
+            sx = marker_combined_grid[:, :, 0]
+            sy = marker_combined_grid[:, :, 1]
+            mag = np.linalg.norm(marker_combined_grid, axis=-1)
+            signed_vmax = max(float(np.max(np.abs(sx))), float(np.max(np.abs(sy))), 1.0e-8)
+            if i < len(handles.get("marker_combined_x_handles", [])):
+                try:
+                    handles["marker_combined_x_handles"][i].image = _label_rgb(
+                        signed_tactile_to_rgb(sx, vmax=signed_vmax),
+                        f"x min {_fmt_scalar(float(sx.min()))}\nx max {_fmt_scalar(float(sx.max()))}",
+                    )
+                except Exception:
+                    pass
+            if i < len(handles.get("marker_combined_y_handles", [])):
+                try:
+                    handles["marker_combined_y_handles"][i].image = _label_rgb(
+                        signed_tactile_to_rgb(sy, vmax=signed_vmax),
+                        f"y min {_fmt_scalar(float(sy.min()))}\ny max {_fmt_scalar(float(sy.max()))}",
+                    )
+                except Exception:
+                    pass
+            if i < len(handles.get("marker_combined_mag_handles", [])):
+                try:
+                    handles["marker_combined_mag_handles"][i].image = _label_rgb(
+                        tactile_to_rgb(mag),
+                        f"|m| max={_fmt_scalar(float(mag.max()))}",
                     )
                 except Exception:
                     pass
@@ -828,6 +985,34 @@ def update_scene_slow(handles, obs, left_ee, right_ee, left_gripper, right_gripp
     main_smag_str = (
         ", ".join(_fmt_scalar(m) for m in main_shear_mag_maxes) if main_shear_mag_maxes else "disabled"
     )
+    marker_sx_str = (
+        ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in marker_shear_x_ranges)
+        if marker_shear_x_ranges
+        else "disabled"
+    )
+    marker_sy_str = (
+        ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in marker_shear_y_ranges)
+        if marker_shear_y_ranges
+        else "disabled"
+    )
+    marker_smag_str = (
+        ", ".join(_fmt_scalar(m) for m in marker_shear_mag_maxes) if marker_shear_mag_maxes else "disabled"
+    )
+    marker_combined_sx_str = (
+        ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in marker_combined_x_ranges)
+        if marker_combined_x_ranges
+        else "disabled"
+    )
+    marker_combined_sy_str = (
+        ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in marker_combined_y_ranges)
+        if marker_combined_y_ranges
+        else "disabled"
+    )
+    marker_combined_smag_str = (
+        ", ".join(_fmt_scalar(m) for m in marker_combined_mag_maxes)
+        if marker_combined_mag_maxes
+        else "disabled"
+    )
     if hydro_maxes:
         hydro_str = ", ".join(_fmt_scalar(m) for m in hydro_maxes)
         sx_str = (
@@ -871,9 +1056,15 @@ def update_scene_slow(handles, obs, left_ee, right_ee, left_gripper, right_gripp
         f"**Left gripper:** {left_gripper:.2f}  \n"
         f"**Right gripper:** {right_gripper:.2f}  \n"
         f"**Tactile max [4 pads]:** [{tac_str}]  \n"
-        f"**Main shear-x min/max [4 pads]:** [{main_sx_str}]  \n"
-        f"**Main shear-y min/max [4 pads]:** [{main_sy_str}]  \n"
-        f"**Main |shear| max [4 pads]:** [{main_smag_str}]  \n"
+        f"**Force shear-x min/max [4 pads]:** [{main_sx_str}]  \n"
+        f"**Force shear-y min/max [4 pads]:** [{main_sy_str}]  \n"
+        f"**Force |shear| max [4 pads]:** [{main_smag_str}]  \n"
+        f"**Marker shear-x min/max [4 pads]:** [{marker_sx_str}]  \n"
+        f"**Marker shear-y min/max [4 pads]:** [{marker_sy_str}]  \n"
+        f"**Marker |shear| max [4 pads]:** [{marker_smag_str}]  \n"
+        f"**Marker combined-x min/max [4 pads]:** [{marker_combined_sx_str}]  \n"
+        f"**Marker combined-y min/max [4 pads]:** [{marker_combined_sy_str}]  \n"
+        f"**Marker combined |xy| max [4 pads]:** [{marker_combined_smag_str}]  \n"
         f"**Hydro normal max [4 pads]:** [{hydro_str}]  \n"
         f"**Hydro shear-x min/max [4 pads]:** [{sx_str}]  \n"
         f"**Hydro shear-y min/max [4 pads]:** [{sy_str}]  \n"

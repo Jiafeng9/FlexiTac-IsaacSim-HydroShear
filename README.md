@@ -92,7 +92,7 @@ Install additional dependencies:
 ```bash
 pip uninstall -y opencv-python-headless
 pip install opencv-python==4.11.0.86
-pip install viser
+pip install viser "websockets>=13"
 ```
 
 ## 🖥️ Replay a Recorded Trajectory

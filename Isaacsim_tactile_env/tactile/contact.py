@@ -4,7 +4,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .elastomer import FlatPatchElastomerSdf, rotate_vectors, transform_points
+from .elastomer import FlatPatchElastomerSdf, MeshPatchElastomerSdf, rotate_vectors, transform_points
 from .surface import ObjectSurfaceSamples
 
 
@@ -16,6 +16,8 @@ class SurfacePointContactState:
     sdf: torch.Tensor
     contact_mask: torch.Tensor
     penetration: torch.Tensor
+    elastomer_normals_p: torch.Tensor | None = None
+    elastomer_normals_e: torch.Tensor | None = None
 
 
 class SurfacePointContactQuery:
@@ -25,7 +27,7 @@ class SurfacePointContactQuery:
     elastomer frame E. Optional patch pose is expressed as patch frame P in E.
     """
 
-    def __init__(self, elastomer_sdf: FlatPatchElastomerSdf | None = None):
+    def __init__(self, elastomer_sdf: FlatPatchElastomerSdf | MeshPatchElastomerSdf | None = None):
         self.elastomer_sdf = elastomer_sdf or FlatPatchElastomerSdf()
 
     def compute(
@@ -54,6 +56,16 @@ class SurfacePointContactQuery:
         sdf_result = self.elastomer_sdf.evaluate(points_e, patch_pos_e=patch_pos_e, patch_quat_e=patch_quat_e)
         penetration = (-sdf_result.sdf).clamp_min(0.0)
         contact_mask = sdf_result.sdf < 0.0
+        elastomer_normals_p = sdf_result.normals_p
+        elastomer_normals_e = None
+        if elastomer_normals_p is not None:
+            if patch_quat_e is not None:
+                elastomer_normals_e = rotate_vectors(elastomer_normals_p, patch_quat_e)
+            else:
+                elastomer_normals_e = elastomer_normals_p
+            elastomer_normals_e = elastomer_normals_e / elastomer_normals_e.norm(
+                dim=-1, keepdim=True
+            ).clamp_min(1.0e-12)
 
         return SurfacePointContactState(
             points_e=points_e,
@@ -62,4 +74,6 @@ class SurfacePointContactQuery:
             sdf=sdf_result.sdf,
             contact_mask=contact_mask,
             penetration=penetration,
+            elastomer_normals_p=elastomer_normals_p,
+            elastomer_normals_e=elastomer_normals_e,
         )

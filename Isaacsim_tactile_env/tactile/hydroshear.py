@@ -81,9 +81,18 @@ class SurfacePointHydroShearTracker:
         d_contact = self._stabilize_frame_displacement(d_contact)
 
         normal_axis = int(self.cfg.normal_axis)
-        d_n_scalar = d_contact[..., normal_axis]
-        d_tangent = d_contact.clone()
-        d_tangent[..., normal_axis] = 0.0
+        elastomer_normals_e = contact.elastomer_normals_e
+        if elastomer_normals_e is not None:
+            elastomer_normals_e = elastomer_normals_e.to(device=d_contact.device, dtype=d_contact.dtype)
+            elastomer_normals_e = elastomer_normals_e / elastomer_normals_e.norm(
+                dim=-1, keepdim=True
+            ).clamp_min(float(self.cfg.eps))
+            d_n_scalar = (d_contact * elastomer_normals_e).sum(dim=-1)
+            d_tangent = d_contact - d_n_scalar.unsqueeze(-1) * elastomer_normals_e
+        else:
+            d_n_scalar = d_contact[..., normal_axis]
+            d_tangent = d_contact.clone()
+            d_tangent[..., normal_axis] = 0.0
 
         prev_normal = float(self.cfg.normal_decay) * prev.normal_displacement
         prev_shear_e = float(self.cfg.shear_decay) * prev.shear_displacement_e
@@ -104,7 +113,10 @@ class SurfacePointHydroShearTracker:
             torch.zeros_like(shear_displacement_e),
         )
         normal_displacement_e = torch.zeros_like(contact.points_e)
-        normal_displacement_e[..., normal_axis] = normal_displacement
+        if elastomer_normals_e is not None:
+            normal_displacement_e = normal_displacement.unsqueeze(-1) * elastomer_normals_e
+        else:
+            normal_displacement_e[..., normal_axis] = normal_displacement
         displacement_e = normal_displacement_e + shear_displacement_e
 
         self.state = SurfacePointHydroShearState(

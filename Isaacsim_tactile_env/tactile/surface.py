@@ -55,6 +55,8 @@ class ObjectMeshSdfResult:
     sdf: torch.Tensor
     unsigned_distance: torch.Tensor
     closest_points_o: torch.Tensor
+    closest_normals_o: torch.Tensor | None = None
+    closest_face_index: torch.Tensor | None = None
 
 
 @dataclass
@@ -219,16 +221,24 @@ def signed_distance_to_mesh(
     sdf_parts = []
     dist_parts = []
     closest_parts = []
+    normal_parts = []
+    face_parts = []
     for start in range(0, points_o.shape[0], int(chunk_size)):
         end = min(start + int(chunk_size), points_o.shape[0])
         part = _signed_distance_to_mesh_chunk(points_o[start:end], triangles, eps=eps)
         sdf_parts.append(part.sdf)
         dist_parts.append(part.unsigned_distance)
         closest_parts.append(part.closest_points_o)
+        if part.closest_normals_o is not None:
+            normal_parts.append(part.closest_normals_o)
+        if part.closest_face_index is not None:
+            face_parts.append(part.closest_face_index)
     return ObjectMeshSdfResult(
         sdf=torch.cat(sdf_parts, dim=0),
         unsigned_distance=torch.cat(dist_parts, dim=0),
         closest_points_o=torch.cat(closest_parts, dim=0),
+        closest_normals_o=torch.cat(normal_parts, dim=0) if normal_parts else None,
+        closest_face_index=torch.cat(face_parts, dim=0) if face_parts else None,
     )
 
 
@@ -239,7 +249,28 @@ def _signed_distance_to_mesh_chunk(points_o: torch.Tensor, triangles: torch.Tens
     unsigned = min_sq_dist.clamp_min(0.0).sqrt()
     inside = _points_inside_closed_mesh(points_o, triangles, eps=eps)
     sdf = torch.where(inside, -unsigned, unsigned)
-    return ObjectMeshSdfResult(sdf=sdf, unsigned_distance=unsigned, closest_points_o=closest_points)
+
+    tri_edges_ab = triangles[:, 1, :] - triangles[:, 0, :]
+    tri_edges_ac = triangles[:, 2, :] - triangles[:, 0, :]
+    face_normals = torch.cross(tri_edges_ab, tri_edges_ac, dim=-1)
+    face_normals = face_normals / face_normals.norm(dim=-1, keepdim=True).clamp_min(float(eps))
+    closest_normals = face_normals[min_face]
+
+    delta = points_o - closest_points
+    has_direction = unsigned > float(eps)
+    delta_dir = delta / unsigned.clamp_min(float(eps)).unsqueeze(-1)
+    gradient_dir = torch.where(inside.unsqueeze(-1), -delta_dir, delta_dir)
+    flip = has_direction & ((closest_normals * gradient_dir).sum(dim=-1) < 0.0)
+    closest_normals = torch.where(flip.unsqueeze(-1), -closest_normals, closest_normals)
+    closest_normals = closest_normals / closest_normals.norm(dim=-1, keepdim=True).clamp_min(float(eps))
+
+    return ObjectMeshSdfResult(
+        sdf=sdf,
+        unsigned_distance=unsigned,
+        closest_points_o=closest_points,
+        closest_normals_o=closest_normals,
+        closest_face_index=min_face,
+    )
 
 
 def _closest_points_on_triangles(points: torch.Tensor, triangles: torch.Tensor, *, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
