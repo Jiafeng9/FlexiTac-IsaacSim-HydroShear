@@ -548,6 +548,63 @@ def test_axis_aligned_motion_only_produces_matching_marker_shear_axis():
     assert abs(float(y_shear[2])) > 1.0e-9
 
 
+def test_force_and_marker_shear_axes_for_all_normal_axes():
+    def run_case(normal_axis: int, move_axis: int):
+        normal = torch.zeros(3, dtype=torch.float32)
+        normal[normal_axis] = -1.0
+        samples = ObjectSurfaceSamples(
+            points_o=torch.zeros((1, 3), dtype=torch.float32),
+            normals_o=normal.view(1, 3),
+            area=torch.ones(1, dtype=torch.float32),
+        )
+        backend = HydroShearTactileBackend(
+            HydroShearTactileBackendCfg(
+                grid=TaxelGridCfg(num_rows=1, num_cols=1, point_distance=0.01, normal_axis=normal_axis),
+                elastomer=FlatPatchElastomerSdfCfg(normal_axis=normal_axis),
+                hydroshear=SurfacePointHydroShearCfg(
+                    normal_stiffness=1.0,
+                    shear_stiffness=1.0,
+                    friction_coefficient=10.0,
+                    normal_axis=normal_axis,
+                ),
+                projection=SurfacePointForceProjectorCfg(lambda_s=0.0, shear_axis_signs=(1.0, 1.0)),
+                marker_projection=HydroShearMarkerReadoutCfg(
+                    lambda_s=0.0,
+                    lambda_d=0.0,
+                    shear_scale=1.0,
+                    dilation_scale=0.0,
+                    shear_axis_signs=(1.0, 1.0),
+                ),
+                output_mode="force_grid",
+                output_key="tactile",
+            )
+        )
+        quat_identity = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32)
+        previous = torch.zeros(3, dtype=torch.float32)
+        previous[normal_axis] = 0.001
+        current = torch.zeros(3, dtype=torch.float32)
+        current[normal_axis] = -0.002
+        moved = current.clone()
+        moved[move_axis] = 0.001
+
+        backend.update(samples, object_pos_e=previous, object_quat_e=quat_identity)
+        backend.update(samples, object_pos_e=current, object_quat_e=quat_identity)
+        out = backend.update(samples, object_pos_e=moved, object_quat_e=quat_identity)
+        return out.observations["tactile_shear"][0, 0], out.observations["tactile_marker_shear"][0, 0]
+
+    for normal_axis in (0, 1, 2):
+        tangent_axes = [0, 1, 2]
+        tangent_axes.remove(normal_axis)
+        for channel, move_axis in enumerate(tangent_axes):
+            force_shear, marker_shear = run_case(normal_axis, move_axis)
+            other_channel = 1 - channel
+            assert abs(float(force_shear[channel])) > 1.0e-9
+            assert_close(force_shear[other_channel], torch.tensor(0.0), atol=1.0e-10)
+            assert_close(marker_shear[0], torch.tensor(0.0), atol=1.0e-10)
+            assert abs(float(marker_shear[channel + 1])) > 1.0e-9
+            assert_close(marker_shear[other_channel + 1], torch.tensor(0.0), atol=1.0e-10)
+
+
 def test_hydroshear_backend_queries_object_sdf_for_marker_dilation():
     vertices, faces = cube_mesh()
     samples = ObjectSurfaceSamples(
@@ -734,6 +791,7 @@ def main():
     test_hydroshear_backend_update_observations()
     test_hydroshear_backend_marker_field_output_mode()
     test_axis_aligned_motion_only_produces_matching_marker_shear_axis()
+    test_force_and_marker_shear_axes_for_all_normal_axes()
     test_hydroshear_backend_queries_object_sdf_for_marker_dilation()
     test_hydroshear_backend_readout_ema()
     test_hydroshear_backend_projected_surface_state_and_reset()

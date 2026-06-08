@@ -13,12 +13,15 @@ from ..helpers.spatial import obj_pose_numpy, xyzw_to_wxyz
 class AlohaObjectsCfg:
     enable_plug: bool = True
     enable_socket: bool = True
+    use_cube_objects: bool = False
     asset_root: str = Path(__file__).resolve().parent.parent.parent / "assets"
     automate_asset_id: str = "00186"
     plug_fix_base: bool = False
     socket_fix_base: bool = False
     plug_scale: float = 1.06
     socket_scale: float = 1.0
+    cube_size: tuple[float, float, float] = (0.026, 0.026, 0.026)
+    cube_mass: float = 0.04
     plug_collider_type: str = "convex_decomposition"
     socket_collider_type: str = "convex_decomposition"
     force_urdf_conversion: bool = True
@@ -68,6 +71,10 @@ class PlugSocketObjects:
         os.makedirs(objs_out_dir, exist_ok=True)
 
         if not (obj_cfg.enable_plug or obj_cfg.enable_socket):
+            return
+
+        if bool(getattr(obj_cfg, "use_cube_objects", False)):
+            self._spawn_cube_objects(sim_utils, RigidObject, RigidObjectCfg)
             return
 
         automate_dir = os.path.join(os.path.expanduser(obj_cfg.asset_root), "automate_scaled", "urdf")
@@ -144,6 +151,59 @@ class PlugSocketObjects:
                 obj_cfg.socket_scale,
                 obj_cfg.socket_fix_base,
                 obj_cfg.socket_collider_type,
+            )
+
+    def _spawn_cube_objects(self, sim_utils, RigidObject, RigidObjectCfg):
+        obj_cfg = self.objects_cfg
+
+        def make_cube_spawn_cfg(fix_base: bool, color: tuple[float, float, float]):
+            return sim_utils.MeshCuboidCfg(
+                size=tuple(float(v) for v in obj_cfg.cube_size),
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                    kinematic_enabled=bool(fix_base),
+                    disable_gravity=bool(fix_base),
+                ),
+                mass_props=sim_utils.MassPropertiesCfg(mass=float(obj_cfg.cube_mass)),
+                collision_props=sim_utils.CollisionPropertiesCfg(
+                    contact_offset=0.002,
+                    rest_offset=0.0,
+                ),
+                physics_material=sim_utils.RigidBodyMaterialCfg(
+                    static_friction=1.0,
+                    dynamic_friction=1.0,
+                    restitution=0.0,
+                ),
+                visual_material=sim_utils.PreviewSurfaceCfg(
+                    diffuse_color=color,
+                    roughness=0.65,
+                ),
+            )
+
+        def spawn_one(pose, prim_path: str, fix_base: bool, color: tuple[float, float, float]):
+            pos = tuple(float(v) for v in pose[:3])
+            rot = xyzw_to_wxyz(pose[3:7])
+            return RigidObject(
+                RigidObjectCfg(
+                    prim_path=prim_path,
+                    spawn=make_cube_spawn_cfg(fix_base, color),
+                    init_state=RigidObjectCfg.InitialStateCfg(pos=pos, rot=rot),
+                )
+            )
+
+        if obj_cfg.enable_plug:
+            self.plug_obj = spawn_one(
+                obj_cfg.plug_default_pose,
+                "/World/Plug",
+                obj_cfg.plug_fix_base,
+                (0.18, 0.38, 0.95),
+            )
+
+        if obj_cfg.enable_socket:
+            self.socket_obj = spawn_one(
+                obj_cfg.socket_default_pose,
+                "/World/Socket",
+                obj_cfg.socket_fix_base,
+                (0.95, 0.48, 0.16),
             )
 
     def reset(self):
