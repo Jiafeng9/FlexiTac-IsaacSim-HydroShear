@@ -1,9 +1,44 @@
-"""Generic tactile-model utilities shared across robot-specific adapters."""
+"""Generic tactile-model utilities shared across robot-specific adapters.
 
-from .backend import HydroShearTactileBackend, HydroShearTactileBackendCfg, HydroShearTactileBackendOutput
-from .contact import SurfacePointContactQuery, SurfacePointContactState
-from .elastomer import FlatPatchElastomerSdf, FlatPatchElastomerSdfCfg, MeshPatchElastomerSdf
+The implementation is grouped into three modules:
+
+- :mod:`tactile.geometry` for mesh sampling, SDFs, transforms, and contact queries.
+- :mod:`tactile.readout` for taxel grids, projections, and taxel-level shear.
+- :mod:`tactile.hydroshear` for the recurrent HydroShear model and backend pipeline.
+
+Legacy submodule names are kept as import aliases for existing scripts.
+"""
+
+from __future__ import annotations
+
+import sys as _sys
+
+from . import geometry as _geometry
+from . import hydroshear as _hydroshear
+from . import readout as _readout
+from .geometry import (
+    ElastomerSdfResult,
+    MeshPatchElastomerSdf,
+    ObjectMeshSdfResult,
+    ObjectSurfaceSampler,
+    ObjectSurfaceSamplerCfg,
+    ObjectSurfaceSamples,
+    PytorchVolumetricMeshSdf,
+    SurfacePointContactQuery,
+    SurfacePointContactState,
+    first_visual_mesh_from_urdf,
+    inverse_transform_points,
+    load_trimesh,
+    normalize_quat_wxyz,
+    quat_apply_wxyz,
+    quat_conjugate_wxyz,
+    rotate_vectors,
+    transform_points,
+)
 from .hydroshear import (
+    HydroShearTactileBackend,
+    HydroShearTactileBackendCfg,
+    HydroShearTactileBackendOutput,
     SurfacePointHydroShearCfg,
     SurfacePointHydroShearOutput,
     SurfacePointHydroShearTracker,
@@ -21,60 +56,71 @@ from .readout import (
     SurfacePointForceProjectorCfg,
     TaxelForceReadout,
     TaxelGridCfg,
-    create_taxel_grid_points,
-    tangential_axes,
-)
-from .surface import (
-    ObjectMeshSdfResult,
-    ObjectSurfaceSampler,
-    ObjectSurfaceSamplerCfg,
-    ObjectSurfaceSamples,
-    signed_distance_to_mesh,
-)
-from .taxel_shear import (
     TaxelShearOutput,
     TaxelShearState,
     TaxelShearTracker,
     TaxelShearTrackerCfg,
     compute_per_taxel_delta_tangent,
+    create_taxel_grid_points,
+    tangential_axes,
     update_taxel_shear_force,
 )
 
+_LEGACY_SUBMODULES = {
+    "backend": _hydroshear,
+    "contact": _geometry,
+    "elastomer": _geometry,
+    "surface": _geometry,
+    "readout": _readout,
+    "taxel_shear": _readout,
+}
+for _name, _module in _LEGACY_SUBMODULES.items():
+    _sys.modules[f"{__name__}.{_name}"] = _module
+    if __name__ != "tactile":
+        _sys.modules.setdefault(f"tactile.{_name}", _module)
+
 __all__ = [
+    "ElastomerSdfResult",
+    "HydroShearMarkerProjector",
+    "HydroShearMarkerReadout",
+    "HydroShearMarkerReadoutCfg",
     "HydroShearTactileBackend",
     "HydroShearTactileBackendCfg",
     "HydroShearTactileBackendOutput",
-    "FlatPatchElastomerSdf",
-    "FlatPatchElastomerSdfCfg",
     "MeshPatchElastomerSdf",
-    "SurfacePointContactState",
-    "SurfacePointContactQuery",
-    "SurfacePointHydroShearCfg",
-    "SurfacePointHydroShearOutput",
-    "SurfacePointHydroShearTracker",
-    "contact_segment_fraction",
-    "ObjectSurfaceSamples",
     "ObjectMeshSdfResult",
-    "ObjectSurfaceSamplerCfg",
     "ObjectSurfaceSampler",
-    "signed_distance_to_mesh",
+    "ObjectSurfaceSamplerCfg",
+    "ObjectSurfaceSamples",
+    "PytorchVolumetricMeshSdf",
     "ProjectedSurfacePointOutput",
     "ProjectedSurfacePointState",
     "ProjectedSurfacePointTracker",
     "ProjectedSurfacePointTrackerCfg",
-    "HydroShearMarkerProjector",
-    "HydroShearMarkerReadout",
-    "HydroShearMarkerReadoutCfg",
+    "SurfacePointContactQuery",
+    "SurfacePointContactState",
     "SurfacePointForceProjector",
     "SurfacePointForceProjectorCfg",
+    "SurfacePointHydroShearCfg",
+    "SurfacePointHydroShearOutput",
+    "SurfacePointHydroShearTracker",
     "TaxelForceReadout",
     "TaxelGridCfg",
-    "create_taxel_grid_points",
-    "tangential_axes",
-    "TaxelShearTrackerCfg",
-    "TaxelShearState",
     "TaxelShearOutput",
+    "TaxelShearState",
     "TaxelShearTracker",
+    "TaxelShearTrackerCfg",
     "compute_per_taxel_delta_tangent",
+    "contact_segment_fraction",
+    "create_taxel_grid_points",
+    "first_visual_mesh_from_urdf",
+    "inverse_transform_points",
+    "load_trimesh",
+    "normalize_quat_wxyz",
+    "quat_apply_wxyz",
+    "quat_conjugate_wxyz",
+    "rotate_vectors",
+    "tangential_axes",
+    "transform_points",
     "update_taxel_shear_force",
 ]

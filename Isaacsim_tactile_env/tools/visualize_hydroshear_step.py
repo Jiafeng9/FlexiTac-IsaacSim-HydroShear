@@ -14,7 +14,7 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("MPLCONFIGDIR", str(ROOT / "output" / ".matplotlib"))
 
 from tactile.contact import SurfacePointContactQuery  # noqa: E402
-from tactile.elastomer import FlatPatchElastomerSdf, FlatPatchElastomerSdfCfg  # noqa: E402
+from tactile.elastomer import MeshPatchElastomerSdf  # noqa: E402
 from tactile.hydroshear import SurfacePointHydroShearCfg, SurfacePointHydroShearTracker  # noqa: E402
 from tactile.readout import (  # noqa: E402
     ProjectedSurfacePointTracker,
@@ -95,6 +95,47 @@ def pose_for_flat_contact(samples_points: torch.Tensor, normal_axis: int, cleara
     return prev, curr
 
 
+def make_slab_mesh(normal_axis: int):
+    axes = [0, 1, 2]
+    axes.remove(normal_axis)
+    vertices = torch.zeros((8, 3), dtype=torch.float32)
+    half_extent = 0.06
+    back = -0.01
+    front = 0.0
+    values = [
+        (-half_extent, -half_extent, back),
+        (half_extent, -half_extent, back),
+        (half_extent, half_extent, back),
+        (-half_extent, half_extent, back),
+        (-half_extent, -half_extent, front),
+        (half_extent, -half_extent, front),
+        (half_extent, half_extent, front),
+        (-half_extent, half_extent, front),
+    ]
+    for i, (u, v, n) in enumerate(values):
+        vertices[i, axes[0]] = u
+        vertices[i, axes[1]] = v
+        vertices[i, normal_axis] = n
+    faces = torch.tensor(
+        [
+            [0, 2, 1],
+            [0, 3, 2],
+            [4, 5, 6],
+            [4, 6, 7],
+            [0, 1, 5],
+            [0, 5, 4],
+            [1, 2, 6],
+            [1, 6, 5],
+            [2, 3, 7],
+            [2, 7, 6],
+            [3, 0, 4],
+            [3, 4, 7],
+        ],
+        dtype=torch.long,
+    )
+    return vertices, faces
+
+
 def _projected_surface_points(
     args,
     surface_points_p: torch.Tensor,
@@ -141,7 +182,14 @@ def main():
     )
     quat_identity = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=samples.points_o.dtype)
 
-    query = SurfacePointContactQuery(FlatPatchElastomerSdf(FlatPatchElastomerSdfCfg(normal_axis=args.normal_axis)))
+    elastomer_vertices, elastomer_faces = make_slab_mesh(int(args.normal_axis))
+    query = SurfacePointContactQuery(
+        MeshPatchElastomerSdf(
+            vertices_p=elastomer_vertices,
+            faces=elastomer_faces,
+            sdf_object_name=f"hydroshear_step_slab_{int(args.normal_axis)}",
+        )
+    )
     tracker = SurfacePointHydroShearTracker(
         SurfacePointHydroShearCfg(
             normal_stiffness=float(args.normal_stiffness),

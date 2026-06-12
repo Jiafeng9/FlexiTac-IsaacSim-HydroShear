@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import os
+import re
 from typing import Any
 
 import numpy as np
@@ -11,7 +14,7 @@ from tactile.backend import (
     HydroShearTactileBackend as CoreHydroShearTactileBackend,
     HydroShearTactileBackendCfg as CoreHydroShearTactileBackendCfg,
 )
-from tactile.elastomer import FlatPatchElastomerSdfCfg, inverse_transform_points, quat_apply_wxyz, quat_conjugate_wxyz
+from tactile.elastomer import inverse_transform_points, quat_apply_wxyz, quat_conjugate_wxyz
 from tactile.hydroshear import SurfacePointHydroShearCfg
 from tactile.readout import (
     HydroShearMarkerReadoutCfg,
@@ -59,21 +62,28 @@ class HydroShearTactileBackendCfg:
 
     dilation_decay: float = 1.0
     shear_decay: float = 1.0
-    normal_stiffness: float = 1.0
-    shear_stiffness: float = 1.0
-    friction_coefficient: float = 0.5
+    E: float = 1.0
+    K: float = 1.0
+    A: float = 1.0
+    mu: float = 10_000.0
+    normal_stiffness: float | None = None
+    shear_stiffness: float | None = None
+    friction_coefficient: float | None = None
     area_mode: str = "unit"
     normal_motion_deadband: float = 0.0
     max_frame_displacement: float | None = None
     readout_ema_alpha: float = 1.0
     surface_point_count: int = 2048
     surface_sample_seed: int | None = 0
-    surface_smooth_normals: bool = False
+    surface_poisson_radius: float = 0.00075
+    surface_poisson_initial_num_points: int = 50_000
+    taxel_surface_margin: float = 0.003
+    taxel_surface_local_z_dir: float = -1.0
     projected_displacement_lambda_d: float = 1.0
     projected_displacement_decay: float = 0.0
     projected_displacement_max: float | None = None
     projected_displacement_include_normal: bool = True
-    projection_lambda_s: float = 10_800.0
+    projection_lambda_s: float = 300.0
     projection_weight_by_penetration: bool | None = None
     normal_projection_weight_by_penetration: bool = False
     shear_projection_weight_by_penetration: bool = True
@@ -81,8 +91,8 @@ class HydroShearTactileBackendCfg:
     normalize_projection_weights: bool = False
     projection_chunk_size: int | None = None
     output_mode: str = "marker_field"
-    marker_lambda_s: float = 10_800.0
-    marker_lambda_d: float = 20_000.0
+    marker_lambda_s: float = 300.0
+    marker_lambda_d: float = 700.0
     marker_shear_scale: float = 1000.0 / 0.065
     marker_dilation_scale: float = 1000.0 / 0.065
     marker_sdf_query_chunk_size: int | None = 64
@@ -96,7 +106,9 @@ class HydroShearTactileBackendCfg:
         (-1.0, 1.0),
         (-1.0, -1.0),
     )
-    use_elastomer_mesh_sdf: bool = True
+    sdf_resolution: float = 0.001
+    sdf_cache_dir: str | None = None
+    sdf_clean_cache: bool = False
     elastomer_sdf_query_chunk_size: int | None = 2048
     include_force_observations: bool = False
     debug_print: bool = False
@@ -115,6 +127,7 @@ class HydroShearSensorState:
     cores: list[CoreHydroShearTactileBackend] | None = None
     elastomer_vertices_p: torch.Tensor | None = None
     elastomer_faces: torch.Tensor | None = None
+    taxel_positions_p: torch.Tensor | None = None
     last_output: Any | None = None
     last_outputs: list[Any] | None = None
 
@@ -488,12 +501,14 @@ class HydroShearTactileBackend:
         for i, state in enumerate(sensors):
             state.body_index = self._resolve_robot_body_index(state.link_path)
             state.samples = self._sample_target_mesh(stage, state.target_query_path, sensor_index=i)
-            if bool(getattr(self.backend_cfg, "use_elastomer_mesh_sdf", True)):
-                state.elastomer_vertices_p, state.elastomer_faces = self._sample_elastomer_mesh(stage, state)
+            state.elastomer_vertices_p, state.elastomer_faces = self._sample_elastomer_mesh(stage, state)
+            state.taxel_positions_p = self._sample_elastomer_taxel_points(state)
             state.core = self._make_core_backend(
                 slot=state.slot,
                 elastomer_vertices_p=state.elastomer_vertices_p,
                 elastomer_faces=state.elastomer_faces,
+                elastomer_sdf_object_name=state.link_path,
+                taxel_positions_p=state.taxel_positions_p,
             )
             state.cores = [state.core]
             state.last_output = None
@@ -548,6 +563,8 @@ class HydroShearTactileBackend:
                             slot=state.slot,
                             elastomer_vertices_p=state.elastomer_vertices_p,
                             elastomer_faces=state.elastomer_faces,
+                            elastomer_sdf_object_name=state.link_path,
+                            taxel_positions_p=state.taxel_positions_p,
                         )
                     )
                 outputs = []
@@ -632,15 +649,19 @@ class HydroShearTactileBackend:
         slot: int | None = None,
         elastomer_vertices_p: torch.Tensor | None = None,
         elastomer_faces: torch.Tensor | None = None,
+        elastomer_sdf_object_name: str | None = None,
+        taxel_positions_p: torch.Tensor | None = None,
     ) -> CoreHydroShearTactileBackend:
         tactile_cfg = self.tactile_cfg
         backend_cfg = self.backend_cfg
+        normal_stiffness, shear_stiffness, friction_coefficient = self._official_force_params(backend_cfg)
         normal_weight_by_penetration = bool(backend_cfg.normal_projection_weight_by_penetration)
         shear_weight_by_penetration = bool(backend_cfg.shear_projection_weight_by_penetration)
         if backend_cfg.projection_weight_by_penetration is not None:
             normal_weight_by_penetration = bool(backend_cfg.projection_weight_by_penetration)
             shear_weight_by_penetration = bool(backend_cfg.projection_weight_by_penetration)
         shear_axis_signs = self._shear_axis_signs_for_slot(slot)
+        elastomer_sdf_name = elastomer_sdf_object_name or f"elastomer_{slot if slot is not None else 0}"
         cfg = CoreHydroShearTactileBackendCfg(
             grid=TaxelGridCfg(
                 num_rows=tactile_cfg.num_rows,
@@ -650,19 +671,18 @@ class HydroShearTactileBackend:
                 normal_offset=tactile_cfg.normal_offset,
                 device=self.device,
             ),
-            elastomer=FlatPatchElastomerSdfCfg(
-                normal_axis=tactile_cfg.normal_axis,
-                surface_offset=tactile_cfg.normal_offset,
-                half_extent_u=float(tactile_cfg.point_distance) * float(tactile_cfg.num_rows) * 0.5,
-                half_extent_v=float(tactile_cfg.point_distance) * float(tactile_cfg.num_cols) * 0.5,
-            ),
+            taxel_positions_p=taxel_positions_p,
             elastomer_vertices_p=elastomer_vertices_p,
             elastomer_faces=elastomer_faces,
             elastomer_sdf_query_chunk_size=backend_cfg.elastomer_sdf_query_chunk_size,
+            elastomer_sdf_resolution=float(backend_cfg.sdf_resolution),
+            elastomer_sdf_cache_path=self._sdf_cache_path(elastomer_sdf_name),
+            elastomer_sdf_object_name=elastomer_sdf_name,
+            elastomer_sdf_clean_cache=bool(backend_cfg.sdf_clean_cache),
             hydroshear=SurfacePointHydroShearCfg(
-                normal_stiffness=backend_cfg.normal_stiffness,
-                shear_stiffness=backend_cfg.shear_stiffness,
-                friction_coefficient=backend_cfg.friction_coefficient,
+                normal_stiffness=normal_stiffness,
+                shear_stiffness=shear_stiffness,
+                friction_coefficient=friction_coefficient,
                 normal_axis=tactile_cfg.normal_axis,
                 area_mode=backend_cfg.area_mode,
                 normal_decay=backend_cfg.dilation_decay,
@@ -704,6 +724,32 @@ class HydroShearTactileBackend:
         )
         return CoreHydroShearTactileBackend(cfg)
 
+    @staticmethod
+    def _official_force_params(backend_cfg) -> tuple[float, float, float]:
+        normal_stiffness = backend_cfg.normal_stiffness
+        if normal_stiffness is None:
+            normal_stiffness = float(backend_cfg.E) * float(backend_cfg.A)
+        shear_stiffness = backend_cfg.shear_stiffness
+        if shear_stiffness is None:
+            shear_stiffness = float(backend_cfg.K) * float(backend_cfg.A)
+        friction_coefficient = backend_cfg.friction_coefficient
+        if friction_coefficient is None:
+            friction_coefficient = float(backend_cfg.mu)
+        return float(normal_stiffness), float(shear_stiffness), float(friction_coefficient)
+
+    def _sdf_cache_path(self, object_name: str) -> str | None:
+        cache_dir = self.backend_cfg.sdf_cache_dir
+        if not cache_dir:
+            return None
+        return str(Path(os.path.expanduser(str(cache_dir))) / f"{_safe_sdf_name(object_name)}_cached_sdf.pkl")
+
+    def _robot_usd_output_dir(self) -> Path:
+        out_dir = getattr(self.robot_cfg, "usd_output_dir", None)
+        if out_dir:
+            return Path(os.path.expanduser(str(out_dir))).resolve()
+        urdf_path = Path(os.path.expanduser(str(self.robot_cfg.urdf_path))).resolve()
+        return urdf_path.parents[1] / "output" / "aloha_urdf"
+
     def _shear_axis_signs_for_slot(self, slot: int | None) -> tuple[float, float]:
         signs_by_slot = self.backend_cfg.shear_axis_signs_by_slot
         if signs_by_slot is not None and slot is not None and 0 <= int(slot) < len(signs_by_slot):
@@ -714,11 +760,8 @@ class HydroShearTactileBackend:
 
     def _sample_target_mesh(self, stage, target_query_path: str, *, sensor_index: int):
         vertices, faces = _usd_mesh_vertices_faces(stage, target_query_path)
-        try:
-            scale = np.asarray(_usd_prim_world_scale(stage, target_query_path), dtype=np.float64).reshape(3)
-            vertices = vertices * scale.reshape(1, 3)
-        except Exception:
-            pass
+        scale = np.asarray(_usd_prim_world_scale(stage, target_query_path), dtype=np.float64).reshape(3)
+        vertices = vertices * scale.reshape(1, 3)
         seed = self.backend_cfg.surface_sample_seed
         if seed is not None:
             seed = int(seed) + int(sensor_index)
@@ -726,7 +769,12 @@ class HydroShearTactileBackend:
             ObjectSurfaceSamplerCfg(
                 num_points=int(self.backend_cfg.surface_point_count),
                 seed=seed,
-                smooth_normals=bool(self.backend_cfg.surface_smooth_normals),
+                poisson_radius=float(self.backend_cfg.surface_poisson_radius),
+                poisson_initial_num_points=int(self.backend_cfg.surface_poisson_initial_num_points),
+                sdf_resolution=float(self.backend_cfg.sdf_resolution),
+                sdf_cache_path=self._sdf_cache_path(f"target_{sensor_index}_{target_query_path}"),
+                sdf_object_name=f"target_{sensor_index}_{target_query_path}",
+                sdf_clean_cache=bool(self.backend_cfg.sdf_clean_cache),
                 device=self.device,
             )
         )
@@ -735,15 +783,40 @@ class HydroShearTactileBackend:
     def _sample_elastomer_mesh(self, stage, state: HydroShearSensorState) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         try:
             vertices_b, faces = _usd_mesh_vertices_faces_in_root(stage, state.link_path)
-        except Exception as e:
-            print(f"[WARN] HydroShear elastomer mesh SDF fallback to flat patch for {state.link_path}: {e}", flush=True)
-            return None, None
+        except RuntimeError as exc:
+            if "No Mesh prim found" not in str(exc):
+                raise
+            vertices_b, faces = _usd_elastomer_collider_mesh_vertices_faces(
+                stage,
+                state.link_path,
+                converted_usd_dir=self._robot_usd_output_dir(),
+            )
+            if self.backend_cfg.debug_print:
+                print(
+                    f"[HydroShear] USD mesh missing under {state.link_path}; "
+                    "using converted USD collider mesh",
+                    flush=True,
+                )
 
         vertices_b_t = torch.as_tensor(vertices_b, dtype=torch.float32, device=self.device)
         patch_pos_b = _to_tensor(state.patch_pos_b, device=self.device)
         patch_quat_b = _to_tensor(state.patch_quat_b, device=self.device)
         vertices_p = inverse_transform_points(vertices_b_t, patch_pos_b, patch_quat_b)
         return vertices_p, torch.as_tensor(faces, dtype=torch.long, device=self.device)
+
+    def _sample_elastomer_taxel_points(self, state: HydroShearSensorState) -> torch.Tensor:
+        if state.elastomer_vertices_p is None or state.elastomer_faces is None:
+            raise RuntimeError(f"HydroShear taxel surface points require elastomer mesh: {state.link_path}")
+        return _raycast_taxel_points_on_mesh(
+            state.elastomer_vertices_p.detach().cpu().numpy(),
+            state.elastomer_faces.detach().cpu().numpy(),
+            num_rows=int(self.tactile_cfg.num_rows),
+            num_cols=int(self.tactile_cfg.num_cols),
+            normal_axis=int(self.tactile_cfg.normal_axis),
+            margin=float(self.backend_cfg.taxel_surface_margin),
+            local_z_dir=float(self.backend_cfg.taxel_surface_local_z_dir),
+            device=self.device,
+        )
 
     def _resolve_robot_body_index(self, link_path: str) -> int:
         body_names = [str(n) for n in self.robot_asset.body_names]
@@ -807,21 +880,107 @@ def _usd_mesh_vertices_faces(stage, mesh_prim_path: str) -> tuple[np.ndarray, np
 
 
 def _usd_mesh_vertices_faces_in_root(stage, root_prim_path: str) -> tuple[np.ndarray, np.ndarray]:
-    from pxr import Gf, Usd, UsdGeom
+    mesh_prim_path = _first_mesh_prim_path_under(stage, root_prim_path)
+    return _usd_mesh_vertices_faces_relative_to_root(stage, mesh_prim_path, root_prim_path)
+
+
+def _usd_elastomer_collider_mesh_vertices_faces(
+    stage,
+    link_prim_path: str,
+    *,
+    converted_usd_dir: Path | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Find the URDF-converter collider mesh for an elastomer link.
+
+    IsaacLab's URDF converter keeps the articulation link at e.g.
+    `/World/Robot/left_arm_elastomer_left`, but places converted geometry under
+    sibling collections such as `/World/Robot/colliders/<link>/.../mesh`.
+    """
+
+    robot_root, link_name = link_prim_path.rsplit("/", 1)
+    parent_root = robot_root.rsplit("/", 1)[0] if "/" in robot_root.strip("/") else ""
+    base_roots = []
+    for base in (robot_root, parent_root, ""):
+        if base not in base_roots:
+            base_roots.append(base)
+
+    errors: list[str] = []
+    for base in base_roots:
+        candidate_root = f"{base}/colliders/{link_name}" if base else f"/colliders/{link_name}"
+        try:
+            mesh_prim_path = _first_mesh_prim_path_under(stage, candidate_root)
+            return _usd_mesh_vertices_faces_relative_to_root(stage, mesh_prim_path, link_prim_path)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+
+    if converted_usd_dir is not None:
+        try:
+            return _converted_usd_elastomer_collider_mesh_vertices_faces(converted_usd_dir, link_name)
+        except RuntimeError as exc:
+            errors.append(str(exc))
+
+    raise RuntimeError("; ".join(errors))
+
+
+def _converted_usd_elastomer_collider_mesh_vertices_faces(
+    converted_usd_dir: Path,
+    link_name: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    from pxr import Usd
+
+    usd_dir = Path(converted_usd_dir)
+    candidates = (
+        usd_dir / "configuration" / "aloha_tactile_base.usd",
+        usd_dir / "aloha_tactile.usd",
+    )
+
+    errors: list[str] = []
+    for usd_path in candidates:
+        if not usd_path.is_file():
+            errors.append(f"missing converted USD: {usd_path}")
+            continue
+        stage = Usd.Stage.Open(str(usd_path))
+        if stage is None:
+            errors.append(f"cannot open converted USD: {usd_path}")
+            continue
+        collider_root = f"/colliders/{link_name}"
+        try:
+            mesh_prim_path = _first_mesh_prim_path_under(stage, collider_root)
+            return _usd_mesh_vertices_faces(stage, mesh_prim_path)
+        except RuntimeError as exc:
+            errors.append(f"{usd_path}: {exc}")
+
+    raise RuntimeError("; ".join(errors))
+
+
+def _first_mesh_prim_path_under(stage, root_prim_path: str) -> str:
+    from pxr import Usd, UsdGeom
 
     root = stage.GetPrimAtPath(root_prim_path)
     if not root or not root.IsValid():
         raise RuntimeError(f"Invalid mesh root prim path: {root_prim_path}")
 
-    mesh_prim = None
     for prim in Usd.PrimRange(root):
         if prim.IsA(UsdGeom.Mesh):
-            mesh_prim = prim
-            break
-    if mesh_prim is None:
-        raise RuntimeError(f"No Mesh prim found under {root_prim_path}")
+            return prim.GetPath().pathString
+    raise RuntimeError(f"No Mesh prim found under {root_prim_path}")
 
-    vertices, faces = _usd_mesh_vertices_faces(stage, mesh_prim.GetPath().pathString)
+
+def _usd_mesh_vertices_faces_relative_to_root(
+    stage,
+    mesh_prim_path: str,
+    root_prim_path: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    from pxr import Gf, Usd, UsdGeom
+
+    root = stage.GetPrimAtPath(root_prim_path)
+    mesh_prim = stage.GetPrimAtPath(mesh_prim_path)
+    if not root or not root.IsValid():
+        raise RuntimeError(f"Invalid mesh root prim path: {root_prim_path}")
+    if not mesh_prim or not mesh_prim.IsValid() or not mesh_prim.IsA(UsdGeom.Mesh):
+        raise RuntimeError(f"Invalid mesh prim path: {mesh_prim_path}")
+
+    vertices, faces = _usd_mesh_vertices_faces(stage, mesh_prim_path)
     mesh_world = UsdGeom.Xformable(mesh_prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
     root_world = UsdGeom.Xformable(root).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
     root_world_inv = root_world.GetInverse()
@@ -842,6 +1001,82 @@ def _usd_prim_world_scale(stage, prim_path: str) -> tuple[float, float, float]:
         raise RuntimeError(f"Invalid prim path for scale query: {prim_path}")
     world_transform = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
     return tuple(float(v.GetLength()) for v in world_transform.ExtractRotationMatrix())
+
+
+def _raycast_taxel_points_on_mesh(
+    vertices,
+    faces,
+    *,
+    num_rows: int,
+    num_cols: int,
+    normal_axis: int,
+    margin: float,
+    local_z_dir: float,
+    device: str,
+) -> torch.Tensor:
+    import open3d as o3d
+
+    vertices_np = np.asarray(vertices, dtype=np.float32)
+    faces_np = np.asarray(faces, dtype=np.int32)
+    if vertices_np.ndim != 2 or vertices_np.shape[1] != 3:
+        raise ValueError(f"vertices must have shape (N, 3), got {vertices_np.shape}")
+    if faces_np.ndim != 2 or faces_np.shape[1] != 3:
+        raise ValueError(f"faces must have shape (F, 3), got {faces_np.shape}")
+
+    bbox_min = vertices_np.min(axis=0)
+    bbox_max = vertices_np.max(axis=0)
+    center = 0.5 * (bbox_min + bbox_max)
+    dims = bbox_max - bbox_min
+    slim_axis = int(np.argmin(dims))
+    if slim_axis != int(normal_axis):
+        raise ValueError(
+            f"HydroShear elastomer slim axis {slim_axis} does not match tactile normal_axis {normal_axis}"
+        )
+
+    axis_idxs = [0, 1, 2]
+    axis_idxs.remove(slim_axis)
+    div_sz = (dims[axis_idxs] - float(margin) * 2.0) / (np.array([num_rows, num_cols], dtype=np.float32) + 1.0)
+    tactile_points_dx = float(np.min(div_sz))
+    if tactile_points_dx <= 0.0:
+        raise ValueError(f"Invalid elastomer taxel spacing {tactile_points_dx}; check mesh size and margin")
+
+    u = np.linspace(
+        center[axis_idxs[0]] - tactile_points_dx * (float(num_rows) + 1.0) / 2.0,
+        center[axis_idxs[0]] + tactile_points_dx * (float(num_rows) + 1.0) / 2.0,
+        num_rows + 2,
+        dtype=np.float32,
+    )[1:-1]
+    v = np.linspace(
+        center[axis_idxs[1]] - tactile_points_dx * (float(num_cols) + 1.0) / 2.0,
+        center[axis_idxs[1]] + tactile_points_dx * (float(num_cols) + 1.0) / 2.0,
+        num_cols + 2,
+        dtype=np.float32,
+    )[1:-1]
+    uu, vv = np.meshgrid(u, v, indexing="ij")
+    origins = np.zeros((num_rows * num_cols, 3), dtype=np.float32)
+    origins[:, axis_idxs[0]] = uu.reshape(-1)
+    origins[:, axis_idxs[1]] = vv.reshape(-1)
+    origins[:, slim_axis] = center[slim_axis]
+
+    ray_dir = np.zeros((origins.shape[0], 3), dtype=np.float32)
+    ray_dir[:, slim_axis] = float(local_z_dir)
+    rays = np.concatenate((origins, ray_dir), axis=-1)
+
+    legacy_mesh = o3d.geometry.TriangleMesh(
+        o3d.utility.Vector3dVector(vertices_np.astype(np.float64)),
+        o3d.utility.Vector3iVector(faces_np),
+    )
+    scene = o3d.t.geometry.RaycastingScene()
+    scene.add_triangles(o3d.t.geometry.TriangleMesh.from_legacy(legacy_mesh))
+    ans = scene.cast_rays(o3d.core.Tensor(rays, dtype=o3d.core.Dtype.Float32))
+    t_hit = ans["t_hit"].numpy().astype(np.float32)
+    if not np.all(np.isfinite(t_hit)):
+        missing = int(np.size(t_hit) - np.count_nonzero(np.isfinite(t_hit)))
+        raise RuntimeError(f"HydroShear taxel raycast missed elastomer mesh for {missing} points")
+
+    points = origins.copy()
+    points[:, slim_axis] = origins[:, slim_axis] + t_hit * float(local_z_dir)
+    return torch.as_tensor(points, dtype=torch.float32, device=device)
 
 
 def _to_tensor(x, *, device: str) -> torch.Tensor:
@@ -885,6 +1120,11 @@ def _hydroshear_primary_shape(backend_cfg, rows: int, cols: int) -> tuple[int, .
     if getattr(backend_cfg, "output_mode", "force_grid") == "marker_field":
         return (rows, cols, 3)
     return (rows, cols)
+
+
+def _safe_sdf_name(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name)).strip("._")
+    return safe or "mesh"
 
 
 def _relative_pose(

@@ -73,8 +73,63 @@ parser.add_argument(
     default=None,
     help="Optional HydroShear tangential stiffness override in --compare_hydro_normal mode.",
 )
+parser.add_argument(
+    "--force_flat_elastomer_sdf",
+    action="store_true",
+    help="Force HydroShear to use the flat patch SDF instead of the elastomer USD mesh SDF.",
+)
+parser.add_argument(
+    "--hydro_debug_print",
+    action="store_true",
+    help="Print HydroShear sensor diagnostics, including whether each pad uses mesh or flat elastomer SDF.",
+)
+parser.add_argument(
+    "--auto_object_slide_probe",
+    choices=("none", "x", "y", "both"),
+    default="none",
+    help="Run object-slide CSV probes automatically from headless mode and exit after they finish.",
+)
+parser.add_argument("--auto_object_slide_pad", type=int, default=2, help="Pad index for --auto_object_slide_probe.")
+parser.add_argument(
+    "--auto_object_slide_distance_mm",
+    type=float,
+    default=2.0,
+    help="Total object-slide distance for --auto_object_slide_probe.",
+)
+parser.add_argument(
+    "--auto_object_slide_step_mm",
+    type=float,
+    default=0.5,
+    help="Per-frame object-slide step for --auto_object_slide_probe.",
+)
+parser.add_argument(
+    "--auto_object_slide_settle_steps",
+    type=int,
+    default=30,
+    help="Settle steps before --auto_object_slide_probe recording starts.",
+)
+parser.add_argument(
+    "--auto_object_slide_hold_steps",
+    type=int,
+    default=1,
+    help="Hold steps between object-slide probe moves.",
+)
+parser.add_argument(
+    "--disable_working_probe_demo",
+    action="store_true",
+    help="Disable the default visual working demo that runs pad2 shear_x then shear_y object slides.",
+)
 AppLauncher.add_app_launcher_args(parser)
+_AUTO_OBJECT_SLIDE_PROBE_EXPLICIT = any(
+    arg == "--auto_object_slide_probe" or arg.startswith("--auto_object_slide_probe=")
+    for arg in sys.argv[1:]
+)
 args = parser.parse_args()
+WORKING_PROBE_DEMO = (
+    args.auto_object_slide_probe == "none"
+    and not _AUTO_OBJECT_SLIDE_PROBE_EXPLICIT
+    and not bool(args.disable_working_probe_demo)
+)
 
 
 def _preload_viser_websockets() -> None:
@@ -296,6 +351,58 @@ def _read_pad_axes_world(env, cfg) -> dict[int, dict[str, np.ndarray]]:
     return axes_by_slot
 
 
+def _read_hydro_target_poses_world(env) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    setup = getattr(env, "_tactile_setup", None)
+    if setup is None:
+        return {}
+    tracker = getattr(setup, "target_tracker", None)
+    states = getattr(setup, "sensors", None)
+    if tracker is None or not states:
+        return {}
+
+    poses_by_slot: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for i, state in enumerate(states):
+        try:
+            slot = int(getattr(state, "slot", i))
+            pos, quat = tracker.target_pose_for_sensor(i)
+            poses_by_slot[slot] = (
+                np.asarray(pos, dtype=np.float64).reshape(3).copy(),
+                _normalize_quat_wxyz_np(np.asarray(quat, dtype=np.float64).reshape(4)),
+            )
+        except Exception:
+            continue
+    return poses_by_slot
+
+
+def _read_hydro_relative_poses(env) -> dict[int, tuple[np.ndarray, np.ndarray]]:
+    setup = getattr(env, "_tactile_setup", None)
+    if setup is None:
+        return {}
+    backend = getattr(setup, "backend", None)
+    tracker = getattr(setup, "target_tracker", None)
+    states = getattr(setup, "sensors", None)
+    if backend is None or tracker is None or not states or not hasattr(backend, "_patch_world_pose"):
+        return {}
+
+    poses_by_slot: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for i, state in enumerate(states):
+        try:
+            slot = int(getattr(state, "slot", i))
+            patch_pos_w, patch_quat_w = backend._patch_world_pose(state)
+            patch_pos = patch_pos_w[0].detach().cpu().numpy() if hasattr(patch_pos_w, "detach") else np.asarray(patch_pos_w)[0]
+            patch_quat = patch_quat_w[0].detach().cpu().numpy() if hasattr(patch_quat_w, "detach") else np.asarray(patch_quat_w)[0]
+            target_pos, target_quat = tracker.target_pose_for_sensor(i)
+            poses_by_slot[slot] = _relative_pose_np(
+                parent_pos_w=np.asarray(patch_pos, dtype=np.float64).reshape(3),
+                parent_quat_w=np.asarray(patch_quat, dtype=np.float64).reshape(4),
+                child_pos_w=np.asarray(target_pos, dtype=np.float64).reshape(3),
+                child_quat_w=np.asarray(target_quat, dtype=np.float64).reshape(4),
+            )
+        except Exception:
+            continue
+    return poses_by_slot
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -332,6 +439,39 @@ def _quat_mul_wxyz(a: np.ndarray, b: np.ndarray) -> np.ndarray:
         w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
         w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
     ], dtype=np.float64)
+
+
+def _quat_conjugate_wxyz_np(q: np.ndarray) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float64).reshape(4).copy()
+    q[1:] *= -1.0
+    return q
+
+
+def _normalize_quat_wxyz_np(q: np.ndarray) -> np.ndarray:
+    q = np.asarray(q, dtype=np.float64).reshape(4)
+    return q / (np.linalg.norm(q) + 1.0e-12)
+
+
+def _quat_angle_between_wxyz(q0: np.ndarray | None, q1: np.ndarray | None) -> float:
+    if q0 is None or q1 is None:
+        return 0.0
+    a = _normalize_quat_wxyz_np(q0)
+    b = _normalize_quat_wxyz_np(q1)
+    dot = float(np.clip(abs(np.dot(a, b)), -1.0, 1.0))
+    return float(2.0 * np.arccos(dot))
+
+
+def _relative_pose_np(
+    *,
+    parent_pos_w: np.ndarray,
+    parent_quat_w: np.ndarray,
+    child_pos_w: np.ndarray,
+    child_quat_w: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    parent_quat_inv = _quat_conjugate_wxyz_np(_normalize_quat_wxyz_np(parent_quat_w))
+    child_pos_parent = _quat_apply_np(parent_quat_inv, np.asarray(child_pos_w, dtype=np.float64).reshape(3) - np.asarray(parent_pos_w, dtype=np.float64).reshape(3))
+    child_quat_parent = _quat_mul_wxyz(parent_quat_inv, _normalize_quat_wxyz_np(child_quat_w))
+    return child_pos_parent, _normalize_quat_wxyz_np(child_quat_parent)
 
 
 # ---------------------------------------------------------------------------
@@ -490,6 +630,8 @@ class SharedState:
         step_m: float,
         settle_steps: int,
         hold_steps: int,
+        auto_place: bool,
+        preload_m: float,
     ):
         with self._lock:
             self._object_slide_trial_requests.append(
@@ -501,6 +643,8 @@ class SharedState:
                     "step_m": max(1.0e-6, float(step_m)),
                     "settle_steps": max(0, int(settle_steps)),
                     "hold_steps": max(1, int(hold_steps)),
+                    "auto_place": bool(auto_place),
+                    "preload_m": max(0.0, float(preload_m)),
                 }
             )
 
@@ -664,10 +808,11 @@ class TrajectoryRecorder:
 class TactileShearCsvRecorder:
     """Streams all tactile_shear taxels to CSV while the Viser button is active."""
 
-    def __init__(self, save_dir: str, pad_labels: list[str], interval: int = 1):
+    def __init__(self, save_dir: str, pad_labels: list[str], interval: int = 1, normal_axis: int = 2):
         self._save_dir = save_dir
         self._pad_labels = list(pad_labels)
         self._interval = max(1, int(interval))
+        self._normal_axis = int(normal_axis)
         os.makedirs(self._save_dir, exist_ok=True)
         self._file = None
         self._writer = None
@@ -681,6 +826,10 @@ class TactileShearCsvRecorder:
         self._prev_right_ee_pos: np.ndarray | None = None
         self._prev_plug_pos: np.ndarray | None = None
         self._prev_socket_pos: np.ndarray | None = None
+        self._prev_plug_quat: np.ndarray | None = None
+        self._prev_socket_quat: np.ndarray | None = None
+        self._prev_hydro_target_poses: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        self._prev_hydro_relative_poses: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
     @property
     def active(self) -> bool:
@@ -697,6 +846,48 @@ class TactileShearCsvRecorder:
     @property
     def path(self) -> str | None:
         return self._path
+
+    def seed_reference_poses(
+        self,
+        *,
+        left_target_pos: np.ndarray | None = None,
+        right_target_pos: np.ndarray | None = None,
+        left_ee_pos: np.ndarray | None = None,
+        right_ee_pos: np.ndarray | None = None,
+        plug_pose: np.ndarray | None = None,
+        socket_pose: np.ndarray | None = None,
+        hydro_target_poses_w: dict[int, tuple[np.ndarray, np.ndarray]] | None = None,
+        hydro_relative_poses: dict[int, tuple[np.ndarray, np.ndarray]] | None = None,
+    ):
+        def vec3(value) -> np.ndarray | None:
+            if value is None:
+                return None
+            return np.asarray(value, dtype=np.float64).reshape(-1)[:3].copy()
+
+        def quat4(value) -> np.ndarray | None:
+            if value is None:
+                return None
+            arr = np.asarray(value, dtype=np.float64).reshape(-1)
+            if arr.size < 7:
+                return None
+            return _normalize_quat_wxyz_np(arr[3:7])
+
+        self._prev_left_target_pos = vec3(left_target_pos)
+        self._prev_right_target_pos = vec3(right_target_pos)
+        self._prev_left_ee_pos = vec3(left_ee_pos)
+        self._prev_right_ee_pos = vec3(right_ee_pos)
+        self._prev_plug_pos = vec3(plug_pose)
+        self._prev_socket_pos = vec3(socket_pose)
+        self._prev_plug_quat = quat4(plug_pose)
+        self._prev_socket_quat = quat4(socket_pose)
+        self._prev_hydro_target_poses = {
+            int(pad): (pos.copy(), quat.copy())
+            for pad, (pos, quat) in (hydro_target_poses_w or {}).items()
+        }
+        self._prev_hydro_relative_poses = {
+            int(pad): (pos.copy(), quat.copy())
+            for pad, (pos, quat) in (hydro_relative_poses or {}).items()
+        }
 
     def start(self) -> str:
         if self.active:
@@ -716,6 +907,7 @@ class TactileShearCsvRecorder:
                 "col",
                 "shear_x",
                 "shear_y",
+                "normal_force",
                 "arm",
                 "target_dx_w",
                 "target_dy_w",
@@ -729,10 +921,15 @@ class TactileShearCsvRecorder:
                 "pad_axis_y_wx",
                 "pad_axis_y_wy",
                 "pad_axis_y_wz",
+                "pad_axis_n_wx",
+                "pad_axis_n_wy",
+                "pad_axis_n_wz",
                 "target_delta_shear_x",
                 "target_delta_shear_y",
                 "ee_delta_shear_x",
                 "ee_delta_shear_y",
+                "target_delta_normal",
+                "ee_delta_normal",
                 "commanded_pad",
                 "commanded_axis",
                 "trial_phase",
@@ -741,17 +938,32 @@ class TactileShearCsvRecorder:
                 "command_dz_w",
                 "command_delta_shear_x",
                 "command_delta_shear_y",
+                "command_delta_normal",
                 "object_name",
                 "object_dx_w",
                 "object_dy_w",
                 "object_dz_w",
                 "object_delta_shear_x",
                 "object_delta_shear_y",
+                "object_delta_normal",
+                "object_rot_angle_rad",
                 "object_command_dx_w",
                 "object_command_dy_w",
                 "object_command_dz_w",
                 "object_command_delta_shear_x",
                 "object_command_delta_shear_y",
+                "object_command_delta_normal",
+                "hydro_target_dx_w",
+                "hydro_target_dy_w",
+                "hydro_target_dz_w",
+                "hydro_target_delta_shear_x",
+                "hydro_target_delta_shear_y",
+                "hydro_target_delta_normal",
+                "hydro_target_rot_angle_rad",
+                "hydro_rel_delta_shear_x",
+                "hydro_rel_delta_shear_y",
+                "hydro_rel_delta_normal",
+                "hydro_rel_rot_angle_rad",
             ]
         )
         self._frames = 0
@@ -762,6 +974,10 @@ class TactileShearCsvRecorder:
         self._prev_right_ee_pos = None
         self._prev_plug_pos = None
         self._prev_socket_pos = None
+        self._prev_plug_quat = None
+        self._prev_socket_quat = None
+        self._prev_hydro_target_poses = {}
+        self._prev_hydro_relative_poses = {}
         self._file_count += 1
         print(f"[SAVE] Tactile shear CSV started: {self._path}", flush=True)
         return self._path
@@ -785,6 +1001,8 @@ class TactileShearCsvRecorder:
         socket_pose: np.ndarray | None = None,
         commanded_object_name: str = "",
         commanded_object_delta_w: np.ndarray | None = None,
+        hydro_target_poses_w: dict[int, tuple[np.ndarray, np.ndarray]] | None = None,
+        hydro_relative_poses: dict[int, tuple[np.ndarray, np.ndarray]] | None = None,
     ):
         if not self.active or self._writer is None:
             return
@@ -797,6 +1015,10 @@ class TactileShearCsvRecorder:
         shear = np.asarray(shear)
         if shear.ndim != 4 or shear.shape[-1] != 2:
             return
+        tactile_force = np.asarray(obs.get("tactile_force")) if obs.get("tactile_force") is not None else None
+        normal_force = None
+        if tactile_force is not None and tactile_force.shape[:3] == shear.shape[:3] and tactile_force.shape[-1] >= 1:
+            normal_force = tactile_force[..., 0]
 
         def vec3(value) -> np.ndarray | None:
             if value is None:
@@ -819,6 +1041,12 @@ class TactileShearCsvRecorder:
         )
         plug_pos = None if plug_pose is None else np.asarray(plug_pose, dtype=np.float64).reshape(-1)[:3]
         socket_pos = None if socket_pose is None else np.asarray(socket_pose, dtype=np.float64).reshape(-1)[:3]
+        plug_quat = None
+        socket_quat = None
+        if plug_pose is not None and np.asarray(plug_pose).size >= 7:
+            plug_quat = _normalize_quat_wxyz_np(np.asarray(plug_pose, dtype=np.float64).reshape(-1)[3:7])
+        if socket_pose is not None and np.asarray(socket_pose).size >= 7:
+            socket_quat = _normalize_quat_wxyz_np(np.asarray(socket_pose, dtype=np.float64).reshape(-1)[3:7])
         commanded_object_delta = (
             np.zeros(3, dtype=np.float64)
             if commanded_object_delta_w is None
@@ -831,6 +1059,40 @@ class TactileShearCsvRecorder:
         right_ee_delta = np.zeros(3, dtype=np.float64) if self._prev_right_ee_pos is None or right_ee is None else right_ee - self._prev_right_ee_pos
         plug_delta = np.zeros(3, dtype=np.float64) if self._prev_plug_pos is None or plug_pos is None else plug_pos - self._prev_plug_pos
         socket_delta = np.zeros(3, dtype=np.float64) if self._prev_socket_pos is None or socket_pos is None else socket_pos - self._prev_socket_pos
+        plug_rot_angle = _quat_angle_between_wxyz(self._prev_plug_quat, plug_quat)
+        socket_rot_angle = _quat_angle_between_wxyz(self._prev_socket_quat, socket_quat)
+
+        hydro_target_curr = {
+            int(pad): (np.asarray(pos, dtype=np.float64).reshape(3), _normalize_quat_wxyz_np(quat))
+            for pad, (pos, quat) in (hydro_target_poses_w or {}).items()
+        }
+        hydro_target_delta_by_pad: dict[int, np.ndarray] = {}
+        hydro_target_rot_by_pad: dict[int, float] = {}
+        for pad, (pos, quat) in hydro_target_curr.items():
+            prev_pose = self._prev_hydro_target_poses.get(pad)
+            if prev_pose is None:
+                hydro_target_delta_by_pad[pad] = np.zeros(3, dtype=np.float64)
+                hydro_target_rot_by_pad[pad] = 0.0
+            else:
+                prev_pos, prev_quat = prev_pose
+                hydro_target_delta_by_pad[pad] = pos - prev_pos
+                hydro_target_rot_by_pad[pad] = _quat_angle_between_wxyz(prev_quat, quat)
+
+        hydro_rel_curr = {
+            int(pad): (np.asarray(pos, dtype=np.float64).reshape(3), _normalize_quat_wxyz_np(quat))
+            for pad, (pos, quat) in (hydro_relative_poses or {}).items()
+        }
+        hydro_rel_delta_by_pad: dict[int, np.ndarray] = {}
+        hydro_rel_rot_by_pad: dict[int, float] = {}
+        for pad, (pos, quat) in hydro_rel_curr.items():
+            prev_pose = self._prev_hydro_relative_poses.get(pad)
+            if prev_pose is None:
+                hydro_rel_delta_by_pad[pad] = np.zeros(3, dtype=np.float64)
+                hydro_rel_rot_by_pad[pad] = 0.0
+            else:
+                prev_pos, prev_quat = prev_pose
+                hydro_rel_delta_by_pad[pad] = pos - prev_pos
+                hydro_rel_rot_by_pad[pad] = _quat_angle_between_wxyz(prev_quat, quat)
 
         self._prev_left_target_pos = None if left_target is None else left_target.copy()
         self._prev_right_target_pos = None if right_target is None else right_target.copy()
@@ -838,8 +1100,17 @@ class TactileShearCsvRecorder:
         self._prev_right_ee_pos = None if right_ee is None else right_ee.copy()
         self._prev_plug_pos = None if plug_pos is None else plug_pos.copy()
         self._prev_socket_pos = None if socket_pos is None else socket_pos.copy()
+        self._prev_plug_quat = None if plug_quat is None else plug_quat.copy()
+        self._prev_socket_quat = None if socket_quat is None else socket_quat.copy()
+        self._prev_hydro_target_poses = {
+            pad: (pos.copy(), quat.copy()) for pad, (pos, quat) in hydro_target_curr.items()
+        }
+        self._prev_hydro_relative_poses = {
+            pad: (pos.copy(), quat.copy()) for pad, (pos, quat) in hydro_rel_curr.items()
+        }
 
         frame = self._frames
+        axis_u, axis_v = _tangential_axes(self._normal_axis)
         rows_out = []
         for pad in range(shear.shape[0]):
             pad_label = self._pad_labels[pad] if pad < len(self._pad_labels) else str(pad)
@@ -857,16 +1128,33 @@ class TactileShearCsvRecorder:
             pad_axes = (pad_axes_w or {}).get(pad, {})
             axis_x_w = np.asarray(pad_axes.get("axis_x_w", np.zeros(3)), dtype=np.float64).reshape(3)
             axis_y_w = np.asarray(pad_axes.get("axis_y_w", np.zeros(3)), dtype=np.float64).reshape(3)
+            axis_n_w = np.asarray(pad_axes.get("normal_w", np.zeros(3)), dtype=np.float64).reshape(3)
             target_delta_shear_x = float(np.dot(target_delta, axis_x_w))
             target_delta_shear_y = float(np.dot(target_delta, axis_y_w))
             ee_delta_shear_x = float(np.dot(ee_delta, axis_x_w))
             ee_delta_shear_y = float(np.dot(ee_delta, axis_y_w))
+            target_delta_normal = float(np.dot(target_delta, axis_n_w))
+            ee_delta_normal = float(np.dot(ee_delta, axis_n_w))
             command_delta_shear_x = float(np.dot(command_delta, axis_x_w))
             command_delta_shear_y = float(np.dot(command_delta, axis_y_w))
+            command_delta_normal = float(np.dot(command_delta, axis_n_w))
             object_delta_shear_x = float(np.dot(object_delta, axis_x_w))
             object_delta_shear_y = float(np.dot(object_delta, axis_y_w))
+            object_delta_normal = float(np.dot(object_delta, axis_n_w))
             object_command_delta_shear_x = float(np.dot(object_command_delta, axis_x_w))
             object_command_delta_shear_y = float(np.dot(object_command_delta, axis_y_w))
+            object_command_delta_normal = float(np.dot(object_command_delta, axis_n_w))
+            object_rot_angle = socket_rot_angle if object_name == "socket" else plug_rot_angle
+            hydro_target_delta = hydro_target_delta_by_pad.get(pad, np.zeros(3, dtype=np.float64))
+            hydro_target_delta_shear_x = float(np.dot(hydro_target_delta, axis_x_w))
+            hydro_target_delta_shear_y = float(np.dot(hydro_target_delta, axis_y_w))
+            hydro_target_delta_normal = float(np.dot(hydro_target_delta, axis_n_w))
+            hydro_target_rot_angle = float(hydro_target_rot_by_pad.get(pad, 0.0))
+            hydro_rel_delta = hydro_rel_delta_by_pad.get(pad, np.zeros(3, dtype=np.float64))
+            hydro_rel_delta_shear_x = float(hydro_rel_delta[axis_u])
+            hydro_rel_delta_shear_y = float(hydro_rel_delta[axis_v])
+            hydro_rel_delta_normal = float(hydro_rel_delta[int(self._normal_axis)])
+            hydro_rel_rot_angle = float(hydro_rel_rot_by_pad.get(pad, 0.0))
             for row in range(shear.shape[1]):
                 for col in range(shear.shape[2]):
                     rows_out.append(
@@ -879,6 +1167,7 @@ class TactileShearCsvRecorder:
                             col,
                             f"{float(shear[pad, row, col, 0]):.17g}",
                             f"{float(shear[pad, row, col, 1]):.17g}",
+                            f"{float(normal_force[pad, row, col] if normal_force is not None else 0.0):.17g}",
                             arm,
                             f"{float(target_delta[0]):.17g}",
                             f"{float(target_delta[1]):.17g}",
@@ -892,10 +1181,15 @@ class TactileShearCsvRecorder:
                             f"{float(axis_y_w[0]):.17g}",
                             f"{float(axis_y_w[1]):.17g}",
                             f"{float(axis_y_w[2]):.17g}",
+                            f"{float(axis_n_w[0]):.17g}",
+                            f"{float(axis_n_w[1]):.17g}",
+                            f"{float(axis_n_w[2]):.17g}",
                             f"{target_delta_shear_x:.17g}",
                             f"{target_delta_shear_y:.17g}",
                             f"{ee_delta_shear_x:.17g}",
                             f"{ee_delta_shear_y:.17g}",
+                            f"{target_delta_normal:.17g}",
+                            f"{ee_delta_normal:.17g}",
                             "" if commanded_pad is None else int(commanded_pad),
                             str(commanded_axis),
                             str(trial_phase),
@@ -904,17 +1198,32 @@ class TactileShearCsvRecorder:
                             f"{float(command_delta[2]):.17g}",
                             f"{command_delta_shear_x:.17g}",
                             f"{command_delta_shear_y:.17g}",
+                            f"{command_delta_normal:.17g}",
                             object_name,
                             f"{float(object_delta[0]):.17g}",
                             f"{float(object_delta[1]):.17g}",
                             f"{float(object_delta[2]):.17g}",
                             f"{object_delta_shear_x:.17g}",
                             f"{object_delta_shear_y:.17g}",
+                            f"{object_delta_normal:.17g}",
+                            f"{object_rot_angle:.17g}",
                             f"{float(object_command_delta[0]):.17g}",
                             f"{float(object_command_delta[1]):.17g}",
                             f"{float(object_command_delta[2]):.17g}",
                             f"{object_command_delta_shear_x:.17g}",
                             f"{object_command_delta_shear_y:.17g}",
+                            f"{object_command_delta_normal:.17g}",
+                            f"{float(hydro_target_delta[0]):.17g}",
+                            f"{float(hydro_target_delta[1]):.17g}",
+                            f"{float(hydro_target_delta[2]):.17g}",
+                            f"{hydro_target_delta_shear_x:.17g}",
+                            f"{hydro_target_delta_shear_y:.17g}",
+                            f"{hydro_target_delta_normal:.17g}",
+                            f"{hydro_target_rot_angle:.17g}",
+                            f"{hydro_rel_delta_shear_x:.17g}",
+                            f"{hydro_rel_delta_shear_y:.17g}",
+                            f"{hydro_rel_delta_normal:.17g}",
+                            f"{hydro_rel_rot_angle:.17g}",
                         ]
                     )
         self._writer.writerows(rows_out)
@@ -1026,12 +1335,12 @@ def create_viser_server(port: int, cfg=None):
     with server.gui.add_folder("Tactile Axis Jog", expand_by_default=False):
         server.gui.add_markdown("Pad2 = right arm / left finger; Pad3 = right arm / right finger.")
         show_tactile_axes = server.gui.add_checkbox("Show pad axes", initial_value=True)
-        jog_step_mm = server.gui.add_slider("Jog step (mm)", min=0.05, max=5.0, step=0.05, initial_value=0.5)
+        jog_step_mm = server.gui.add_slider("Jog step (mm)", min=0.05, max=20.0, step=0.05, initial_value=0.5)
         demo_steps = server.gui.add_slider("Demo steps", min=1, max=120, step=1, initial_value=40)
         controlled_total_move_mm = server.gui.add_slider(
             "Controlled total move (mm)",
             min=0.05,
-            max=50.0,
+            max=200.0,
             step=0.05,
             initial_value=2.0,
         )
@@ -1065,6 +1374,14 @@ def create_viser_server(port: int, cfg=None):
         controlled_pad3_x = server.gui.add_button("Controlled Pad3 +shear_x CSV")
         controlled_pad3_y = server.gui.add_button("Controlled Pad3 +shear_y CSV")
         server.gui.add_markdown("Object slide moves the plug cube directly, without robot IK.")
+        object_auto_place = server.gui.add_checkbox("Object slide auto-place", initial_value=True)
+        object_preload_mm = server.gui.add_slider(
+            "Object preload (mm)",
+            min=0.0,
+            max=5.0,
+            step=0.05,
+            initial_value=1.0,
+        )
         object_pad2_x = server.gui.add_button("Object Slide Pad2 +shear_x CSV")
         object_pad2_y = server.gui.add_button("Object Slide Pad2 +shear_y CSV")
         object_pad3_x = server.gui.add_button("Object Slide Pad3 +shear_x CSV")
@@ -1142,6 +1459,8 @@ def create_viser_server(port: int, cfg=None):
                 float(jog_step_mm.value) * 1.0e-3,
                 int(controlled_settle_steps.value),
                 int(controlled_hold_steps.value),
+                bool(object_auto_place.value),
+                float(object_preload_mm.value) * 1.0e-3,
             )
 
     hydro_enabled = getattr(cfg.tactile, "enable_hydro_normal_observation", False)
@@ -1159,6 +1478,7 @@ def create_viser_server(port: int, cfg=None):
             for label in pad_labels
         ]
     hydro_handles = []
+    main_force_normal_handles = []
     main_shear_x_handles = []
     main_shear_y_handles = []
     main_shear_mag_handles = []
@@ -1172,6 +1492,11 @@ def create_viser_server(port: int, cfg=None):
     marker_combined_y_handles = []
     marker_combined_mag_handles = []
     if main_shear_enabled:
+        with server.gui.add_folder("Force Normal"):
+            main_force_normal_handles = [
+                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
+                for label in pad_labels
+            ]
         with server.gui.add_folder("Force Shear X"):
             main_shear_x_handles = [
                 server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
@@ -1241,6 +1566,10 @@ def create_viser_server(port: int, cfg=None):
 
     with server.gui.add_folder("State", expand_by_default=False):
         state_md = server.gui.add_markdown("**Loading...**")
+    with server.gui.add_folder("HydroShear Debug", expand_by_default=True):
+        hydro_debug_md = server.gui.add_markdown(
+            "**Vectors:** blue=command, orange=HydroShear relative motion, purple=force shear."
+        )
 
     with server.gui.add_folder("Sim Camera", expand_by_default=False):
         camera_img = server.gui.add_image(
@@ -1277,6 +1606,22 @@ def create_viser_server(port: int, cfg=None):
         head_length=0.012,
         visible=False,
     )
+    hydro_debug_arrows = server.scene.add_arrows(
+        "/hydroshear_debug_vectors",
+        points=np.zeros((3, 2, 3), dtype=np.float32),
+        colors=np.array(
+            [
+                [0, 120, 255],    # commanded motion
+                [255, 120, 0],    # HydroShear relative motion
+                [180, 80, 255],   # final force shear readout
+            ],
+            dtype=np.uint8,
+        ),
+        shaft_radius=0.0022,
+        head_radius=0.0055,
+        head_length=0.012,
+        visible=False,
+    )
 
     handles = {
         "server": server,
@@ -1291,8 +1636,10 @@ def create_viser_server(port: int, cfg=None):
         "shear_csv_btn": shear_csv_btn,
         "tactile_axis_arrows": tactile_axis_arrows,
         "axis_jog_arrow": axis_jog_arrow,
+        "hydro_debug_arrows": hydro_debug_arrows,
         "tac_handles": tac_handles,
         "hydro_handles": hydro_handles,
+        "main_force_normal_handles": main_force_normal_handles,
         "main_shear_x_handles": main_shear_x_handles,
         "main_shear_y_handles": main_shear_y_handles,
         "main_shear_mag_handles": main_shear_mag_handles,
@@ -1306,6 +1653,7 @@ def create_viser_server(port: int, cfg=None):
         "marker_combined_y_handles": marker_combined_y_handles,
         "marker_combined_mag_handles": marker_combined_mag_handles,
         "state_md": state_md,
+        "hydro_debug_md": hydro_debug_md,
         "camera_img": camera_img,
     }
     return server, handles
@@ -1487,6 +1835,115 @@ def update_axis_jog_arrow(handles, segment: tuple[np.ndarray, np.ndarray, str] |
         pass
 
 
+def _ratio_text(primary: float, secondary: float) -> str:
+    primary = abs(float(primary))
+    secondary = abs(float(secondary))
+    if primary <= 1.0e-30 and secondary <= 1.0e-30:
+        return "0"
+    return f"{primary / (secondary + 1.0e-30):.1f}:1"
+
+
+def _pad_force_shear_vector_w(obs, pad: int, axes: dict[str, np.ndarray]) -> tuple[np.ndarray, tuple[float, float]]:
+    shear_uv = tactile_shear_uv(obs.get("tactile_shear"))
+    if shear_uv is None or pad < 0 or pad >= int(shear_uv.shape[0]):
+        return np.zeros(3, dtype=np.float64), (0.0, 0.0)
+
+    grid = np.asarray(shear_uv[pad], dtype=np.float64)
+    if grid.ndim != 3 or grid.shape[-1] < 2:
+        return np.zeros(3, dtype=np.float64), (0.0, 0.0)
+
+    mask = None
+    tactile_force = obs.get("tactile_force")
+    if tactile_force is not None:
+        force = np.asarray(tactile_force)
+        if force.ndim >= 4 and pad < int(force.shape[0]) and force.shape[-1] >= 1:
+            normal = np.asarray(force[pad, ..., 0], dtype=np.float64)
+            if normal.shape == grid.shape[:2]:
+                mask = np.abs(normal) > 1.0e-12
+
+    if mask is not None and np.any(mask):
+        sx = float(np.mean(grid[..., 0][mask]))
+        sy = float(np.mean(grid[..., 1][mask]))
+    else:
+        sx = float(np.mean(grid[..., 0]))
+        sy = float(np.mean(grid[..., 1]))
+
+    axis_x = _unit_vec(axes.get("axis_x_w", np.zeros(3)))
+    axis_y = _unit_vec(axes.get("axis_y_w", np.zeros(3)))
+    return axis_x * sx + axis_y * sy, (sx, sy)
+
+
+def update_hydroshear_debug_vectors(
+    handles,
+    obs,
+    pad_axes_w: dict[int, dict[str, np.ndarray]],
+    *,
+    pad: int | None,
+    command_delta_w: np.ndarray,
+    hydro_rel_delta_p: np.ndarray,
+    visible: bool = True,
+) -> str:
+    handle = handles.get("hydro_debug_arrows")
+    if handle is None or pad is None:
+        if handle is not None:
+            try:
+                handle.visible = False
+            except Exception:
+                pass
+        return "disabled"
+
+    axes = pad_axes_w.get(int(pad))
+    if axes is None:
+        try:
+            handle.visible = False
+        except Exception:
+            pass
+        return f"pad{pad}: no pad axes"
+
+    origin = np.asarray(axes.get("position_w", np.zeros(3)), dtype=np.float64).reshape(3)
+    axis_x = _unit_vec(axes.get("axis_x_w", np.zeros(3)))
+    axis_y = _unit_vec(axes.get("axis_y_w", np.zeros(3)))
+    normal = _unit_vec(axes.get("normal_w", np.zeros(3)))
+    origin = origin + normal * 0.018
+
+    command_delta_w = np.asarray(command_delta_w, dtype=np.float64).reshape(3)
+    hydro_rel_delta_p = np.asarray(hydro_rel_delta_p, dtype=np.float64).reshape(3)
+    hydro_delta_w = (
+        axis_x * float(hydro_rel_delta_p[0])
+        + axis_y * float(hydro_rel_delta_p[1])
+        + normal * float(hydro_rel_delta_p[2])
+    )
+    force_shear_w, force_shear_xy = _pad_force_shear_vector_w(obs, int(pad), axes)
+
+    command_xy = (float(np.dot(command_delta_w, axis_x)), float(np.dot(command_delta_w, axis_y)))
+    hydro_xy = (float(hydro_rel_delta_p[0]), float(hydro_rel_delta_p[1]))
+
+    vectors = [command_delta_w, hydro_delta_w, force_shear_w]
+    scales = [80.0, 80.0, 2500.0]
+    offsets = [0.0, 0.012, 0.024]
+    points = np.zeros((3, 2, 3), dtype=np.float32)
+    for i, (vec, scale, offset) in enumerate(zip(vectors, scales, offsets, strict=True)):
+        start = origin + normal * offset
+        end = start + np.asarray(vec, dtype=np.float64).reshape(3) * scale
+        points[i, 0] = start.astype(np.float32)
+        points[i, 1] = end.astype(np.float32)
+
+    try:
+        handle.points = points
+        handle.visible = bool(visible)
+    except Exception:
+        pass
+
+    command_ratio = _ratio_text(command_xy[0], command_xy[1])
+    hydro_ratio = _ratio_text(hydro_xy[0], hydro_xy[1])
+    force_ratio = _ratio_text(force_shear_xy[0], force_shear_xy[1])
+    return (
+        f"pad{pad} vectors: blue=command ({command_xy[0]:.2e},{command_xy[1]:.2e}, x/y {command_ratio}); "
+        f"orange=hydro_rel ({hydro_xy[0]:.2e},{hydro_xy[1]:.2e}, x/y {hydro_ratio}); "
+        f"purple=force_shear ({force_shear_xy[0]:.2e},{force_shear_xy[1]:.2e}, x/y {force_ratio})"
+    )
+
+
 def reset_tactile_state(env) -> None:
     setup = getattr(env, "_tactile_setup", None)
     if setup is None:
@@ -1495,6 +1952,61 @@ def reset_tactile_state(env) -> None:
         setup.reset()
     except Exception as e:
         print(f"[WARN] Failed to reset tactile state: {e}", flush=True)
+
+
+def zero_hydroshear_shear_preserve_normal(env) -> int:
+    setup = getattr(env, "_tactile_setup", None)
+    if setup is None:
+        return 0
+    sensors = getattr(setup, "sensors", None) or []
+    count = 0
+    for state in sensors:
+        cores = getattr(state, "cores", None)
+        outputs = getattr(state, "last_outputs", None)
+        if outputs is None:
+            last_output = getattr(state, "last_output", None)
+            outputs = [last_output] if last_output is not None else []
+        if cores is None:
+            core = getattr(state, "core", None)
+            cores = [core] if core is not None else []
+        for core, out in zip(cores, outputs, strict=False):
+            if core is None or out is None or getattr(core, "tracker", None) is None:
+                continue
+            surface_state = getattr(out.surface, "state", None)
+            if surface_state is None:
+                continue
+            core.tracker.state = type(surface_state)(
+                prev_points_e=out.contact.points_e.detach().clone(),
+                prev_sdf=out.contact.sdf.detach().clone(),
+                normal_displacement=out.surface.normal_displacement.detach().clone(),
+                shear_displacement_e=torch.zeros_like(out.surface.shear_displacement_e),
+                initialized=torch.ones_like(out.contact.sdf, dtype=torch.bool),
+            )
+            count += 1
+    return count
+
+
+def hydroshear_elastomer_source_summary(env) -> str:
+    setup = getattr(env, "_tactile_setup", None)
+    backend = getattr(setup, "backend", None)
+    sensors = getattr(setup, "sensors", None)
+    if not sensors or backend is None or not hasattr(backend, "_patch_world_pose"):
+        return "disabled"
+
+    parts = []
+    for i, state in enumerate(sensors):
+        slot = getattr(state, "slot", i)
+        vertices = getattr(state, "elastomer_vertices_p", None)
+        faces = getattr(state, "elastomer_faces", None)
+        if vertices is not None and faces is not None:
+            try:
+                source = f"mesh(v={int(vertices.shape[0])},f={int(faces.shape[0])})"
+            except Exception:
+                source = "mesh"
+        else:
+            source = "flat"
+        parts.append(f"pad{int(slot)}={source}")
+    return ", ".join(parts) if parts else "disabled"
 
 
 def update_scene_fast(handles, obs, left_ee_pos, left_ee_quat, right_ee_pos, right_ee_quat, joint_name_map, urdf_joint_names):
@@ -1540,8 +2052,15 @@ def update_scene_slow(
     shear_csv_recording=False,
     shear_csv_frames=0,
     shear_csv_rows=0,
+    hydroshear_source_summary="disabled",
 ):
     tactile = obs["tactile"]
+    tactile_force = obs.get("tactile_force")
+    tactile_force_normal = None
+    if tactile_force is not None:
+        tactile_force = np.asarray(tactile_force)
+        if tactile_force.ndim >= 4 and tactile_force.shape[-1] >= 1:
+            tactile_force_normal = tactile_force[..., 0]
     tactile_shear = tactile_shear_uv(obs.get("tactile_shear"))
     tactile_marker_shear = tactile_marker_vector_uv(obs.get("tactile_marker_shear"))
     tactile_marker_combined = tactile_marker_vector_uv(obs.get("tactile_marker"))
@@ -1550,6 +2069,7 @@ def update_scene_slow(
     if tactile_hydro_shear is None:
         tactile_hydro_shear = tactile_shear_uv(obs.get("tactile_hydro_shear"))
     tac_maxes = []
+    force_normal_maxes = []
     main_shear_x_ranges = []
     main_shear_y_ranges = []
     main_shear_mag_maxes = []
@@ -1568,6 +2088,9 @@ def update_scene_slow(
         grid_normal = tactile_normal_channel(grid)
         tac_maxes.append(float(grid_normal.max()))
         main_shear_grid = tactile_shear[i] if tactile_shear is not None else None
+        force_normal_grid = tactile_force_normal[i] if tactile_force_normal is not None else None
+        if force_normal_grid is not None:
+            force_normal_maxes.append(float(np.max(force_normal_grid)))
         if main_shear_grid is not None:
             sx = main_shear_grid[:, :, 0]
             sy = main_shear_grid[:, :, 1]
@@ -1640,6 +2163,14 @@ def update_scene_slow(
                     )
                 except Exception:
                     pass
+        if force_normal_grid is not None and i < len(handles.get("main_force_normal_handles", [])):
+            try:
+                handles["main_force_normal_handles"][i].image = _label_rgb(
+                    tactile_to_rgb(force_normal_grid),
+                    f"force max={_fmt_scalar(float(np.max(force_normal_grid)))}",
+                )
+            except Exception:
+                pass
         if marker_shear_grid is not None:
             sx = marker_shear_grid[:, :, 0]
             sy = marker_shear_grid[:, :, 1]
@@ -1773,6 +2304,9 @@ def update_scene_slow(
     main_smag_str = (
         ", ".join(_fmt_scalar(m) for m in main_shear_mag_maxes) if main_shear_mag_maxes else "disabled"
     )
+    force_normal_str = (
+        ", ".join(_fmt_scalar(m) for m in force_normal_maxes) if force_normal_maxes else "disabled"
+    )
     marker_sx_str = (
         ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in marker_shear_x_ranges)
         if marker_shear_x_ranges
@@ -1847,9 +2381,11 @@ def update_scene_slow(
         f"**Left gripper:** {left_gripper:.2f}  \n"
         f"**Right gripper:** {right_gripper:.2f}  \n"
         f"**Shear CSV:** {shear_csv_status}  \n"
+        f"**HydroShear elastomer SDF:** {hydroshear_source_summary}  \n"
         f"**Shear vis:** vmax={shear_vis_vmax_str}, deadband={shear_vis_deadband_str} display-only  \n"
         f"**Pad axes:** cyan=shear_x, orange=shear_y, green=normal  \n"
         f"**Tactile max [4 pads]:** [{tac_str}]  \n"
+        f"**Force normal max [4 pads]:** [{force_normal_str}]  \n"
         f"**Force shear-x min/max [4 pads]:** [{main_sx_str}]  \n"
         f"**Force shear-y min/max [4 pads]:** [{main_sy_str}]  \n"
         f"**Force |shear| max [4 pads]:** [{main_smag_str}]  \n"
@@ -1946,6 +2482,63 @@ def write_rigid_object_pose_w(obj, pos_w: np.ndarray, quat_wxyz: np.ndarray):
     obj.write_root_velocity_to_sim(vel_t)
 
 
+def _quat_from_matrix_wxyz(rot: np.ndarray) -> np.ndarray:
+    rot = np.asarray(rot, dtype=np.float64).reshape(3, 3)
+    trace = float(np.trace(rot))
+    if trace > 0.0:
+        s = np.sqrt(trace + 1.0) * 2.0
+        w = 0.25 * s
+        x = (rot[2, 1] - rot[1, 2]) / s
+        y = (rot[0, 2] - rot[2, 0]) / s
+        z = (rot[1, 0] - rot[0, 1]) / s
+    elif rot[0, 0] > rot[1, 1] and rot[0, 0] > rot[2, 2]:
+        s = np.sqrt(1.0 + rot[0, 0] - rot[1, 1] - rot[2, 2]) * 2.0
+        w = (rot[2, 1] - rot[1, 2]) / s
+        x = 0.25 * s
+        y = (rot[0, 1] + rot[1, 0]) / s
+        z = (rot[0, 2] + rot[2, 0]) / s
+    elif rot[1, 1] > rot[2, 2]:
+        s = np.sqrt(1.0 + rot[1, 1] - rot[0, 0] - rot[2, 2]) * 2.0
+        w = (rot[0, 2] - rot[2, 0]) / s
+        x = (rot[0, 1] + rot[1, 0]) / s
+        y = 0.25 * s
+        z = (rot[1, 2] + rot[2, 1]) / s
+    else:
+        s = np.sqrt(1.0 + rot[2, 2] - rot[0, 0] - rot[1, 1]) * 2.0
+        w = (rot[1, 0] - rot[0, 1]) / s
+        x = (rot[0, 2] + rot[2, 0]) / s
+        y = (rot[1, 2] + rot[2, 1]) / s
+        z = 0.25 * s
+    quat = np.asarray([w, x, y, z], dtype=np.float64)
+    return quat / (np.linalg.norm(quat) + 1.0e-12)
+
+
+def object_contact_pose_from_pad(pad_axes: dict[str, np.ndarray], cfg, preload_m: float) -> tuple[np.ndarray, np.ndarray] | None:
+    normal_axis = int(cfg.tactile.normal_axis)
+    axis_u, axis_v = _tangential_axes(normal_axis)
+    normal_w = _unit_vec(pad_axes.get("normal_w", np.zeros(3)))
+    shear_x_w = _unit_vec(pad_axes.get("axis_x_w", np.zeros(3)))
+    shear_y_w = _unit_vec(pad_axes.get("axis_y_w", np.zeros(3)))
+    pad_pos_w = np.asarray(pad_axes.get("position_w", np.zeros(3)), dtype=np.float64).reshape(3)
+    if not np.any(normal_w) or not np.any(shear_x_w) or not np.any(shear_y_w):
+        return None
+
+    rot = np.zeros((3, 3), dtype=np.float64)
+    rot[:, normal_axis] = normal_w
+    rot[:, axis_u] = shear_x_w
+    rot[:, axis_v] = shear_y_w
+    if np.linalg.det(rot) < 0.0:
+        rot[:, axis_v] *= -1.0
+
+    cube_size = np.asarray(cfg.objects.cube_size, dtype=np.float64).reshape(3)
+    half_normal_extent = 0.5 * float(cube_size[normal_axis])
+    surface_offset = float(cfg.tactile.normal_offset)
+    center_offset = surface_offset + half_normal_extent - float(preload_m)
+    pos_w = pad_pos_w + normal_w * center_offset
+    quat_wxyz = _quat_from_matrix_wxyz(rot)
+    return pos_w, quat_wxyz
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1979,10 +2572,14 @@ def main():
         cfg.tactile.backend = TaxelShearTactileBackendCfg()
     elif args.tactile_backend == "surface_hydro":
         cfg.tactile.backend = HydroShearTactileBackendCfg(include_force_observations=True)
+        cfg.tactile.backend.use_elastomer_mesh_sdf = not bool(args.force_flat_elastomer_sdf)
+        cfg.tactile.backend.debug_print = True
     cfg.tactile.enable_hydro_normal_observation = bool(args.compare_hydro_normal)
     cfg.tactile.hydro_normal_backend.include_force_observations = bool(args.compare_hydro_normal)
     cfg.tactile.hydro_normal_backend.normal_readout_scale = float(args.hydro_normal_scale)
     cfg.tactile.hydro_normal_backend.shear_readout_scale = float(args.hydro_shear_scale)
+    cfg.tactile.hydro_normal_backend.use_elastomer_mesh_sdf = not bool(args.force_flat_elastomer_sdf)
+    cfg.tactile.hydro_normal_backend.debug_print = bool(args.hydro_debug_print)
     if args.hydro_shear_stiffness is not None:
         cfg.tactile.hydro_normal_backend.shear_stiffness = float(args.hydro_shear_stiffness)
 
@@ -1998,6 +2595,7 @@ def main():
     handles["state_md"].content = "**Loading Isaac Sim environment...**"
     env = AlohaTactileEnv(cfg, simulation_app=simulation_app)
     obs, _ = env.reset()
+    print(f"[HydroShear] elastomer sources: {hydroshear_elastomer_source_summary(env)}", flush=True)
 
     left_ik = AlohaArmIKController(robot=env._robot, device=cfg.sim.device, arm="left")
     right_ik = AlohaArmIKController(robot=env._robot, device=cfg.sim.device, arm="right")
@@ -2037,6 +2635,7 @@ def main():
             "Right arm / right finger",
         ],
         interval=int(args.shear_csv_interval),
+        normal_axis=int(cfg.tactile.normal_axis),
     )
     print(f"[INFO] Tactile shear CSV will be saved to: {shear_csv_dir}", flush=True)
 
@@ -2072,6 +2671,22 @@ def main():
     was_shear_csv_recording = False
     controlled_trial: dict | None = None
     object_slide_trial: dict | None = None
+    auto_probe_axes: list[str] = []
+    auto_probe_visual_demo = bool(WORKING_PROBE_DEMO)
+    if auto_probe_visual_demo:
+        auto_probe_axes = ["x", "y"]
+        print(
+            "[AUTO] Working probe demo enabled: pad2 shear_x then shear_y, "
+            "5.00mm total, 0.50mm step, 180 settle steps.",
+            flush=True,
+        )
+    elif args.auto_object_slide_probe == "both":
+        auto_probe_axes = ["x", "y"]
+    elif args.auto_object_slide_probe in ("x", "y"):
+        auto_probe_axes = [str(args.auto_object_slide_probe)]
+    auto_probe_pending_axis: str | None = None
+    auto_probe_complete = False
+    prev_debug_hydro_relative_poses = _read_hydro_relative_poses(env)
 
     while simulation_app.is_running():
         recording = shared.is_recording()
@@ -2085,6 +2700,14 @@ def main():
 
         if shear_csv_recording and not was_shear_csv_recording:
             shear_csv_recorder.start()
+            shear_csv_recorder.seed_reference_poses(
+                left_target_pos=np.array(shared.get_target("left"), dtype=np.float64),
+                right_target_pos=np.array(shared.get_target("right"), dtype=np.float64),
+                plug_pose=obs.get("plug_pose"),
+                socket_pose=obs.get("socket_pose"),
+                hydro_target_poses_w=_read_hydro_target_poses_world(env),
+                hydro_relative_poses=_read_hydro_relative_poses(env),
+            )
         if was_shear_csv_recording and not shear_csv_recording:
             path = shear_csv_recorder.stop()
             if path:
@@ -2119,6 +2742,37 @@ def main():
                 f"hold={trial_request['hold_steps']}"
             )
 
+        if (
+            auto_probe_axes
+            and auto_probe_pending_axis is None
+            and controlled_trial is None
+            and object_slide_trial is None
+            and not shear_csv_recorder.active
+        ):
+            axis = auto_probe_axes.pop(0)
+            pad = 2 if auto_probe_visual_demo else int(np.clip(int(args.auto_object_slide_pad), 0, 3))
+            distance_mm = 5.0 if auto_probe_visual_demo else max(0.0, float(args.auto_object_slide_distance_mm))
+            step_mm = 0.5 if auto_probe_visual_demo else max(0.001, float(args.auto_object_slide_step_mm))
+            settle_steps = 180 if auto_probe_visual_demo else max(0, int(args.auto_object_slide_settle_steps))
+            hold_steps = 12 if auto_probe_visual_demo else max(1, int(args.auto_object_slide_hold_steps))
+            shared.request_object_slide_trial(
+                pad=pad,
+                axis=axis,
+                direction=1.0,
+                distance_m=distance_mm * 1.0e-3,
+                step_m=step_mm * 1.0e-3,
+                settle_steps=settle_steps,
+                hold_steps=hold_steps,
+                auto_place=True,
+                preload_m=0.001,
+            )
+            auto_probe_pending_axis = axis
+            print(
+                f"[AUTO] Object slide probe queued: pad{pad} shear_{axis} "
+                f"distance={distance_mm:.2f}mm step={step_mm:.2f}mm settle={settle_steps}",
+                flush=True,
+            )
+
         object_slide_request = shared.consume_object_slide_trial_request()
         if object_slide_request is not None:
             controlled_trial = None
@@ -2129,7 +2783,8 @@ def main():
             handles["shear_csv_btn"].name = "Start Shear CSV"
             handles["shear_csv_btn"].color = "blue"
             was_shear_csv_recording = False
-            reset_tactile_state(env)
+            if bool(object_slide_request.get("auto_place", True)):
+                reset_tactile_state(env)
             object_slide_trial = {
                 **object_slide_request,
                 "phase": "settle",
@@ -2139,13 +2794,18 @@ def main():
                 "object_name": "socket" if int(object_slide_request["pad"]) < 2 else "plug",
                 "object_pos_w": None,
                 "object_quat_w": None,
+                "robot_hold_action": None,
+                "preload_reference_done": False,
+                "preload_pose_applied": False,
             }
             handles["state_md"].content = (
                 f"**Object slide armed:** {object_slide_trial['object_name']} pad{object_slide_request['pad']} "
                 f"shear_{object_slide_request['axis']} settle={object_slide_request['settle_steps']} "
                 f"move={object_slide_request['distance_m'] * 1.0e3:.2f}mm "
                 f"step={object_slide_request['step_m'] * 1.0e3:.2f}mm "
-                f"hold={object_slide_request['hold_steps']}"
+                f"hold={object_slide_request['hold_steps']} "
+                f"auto_place={object_slide_request['auto_place']} "
+                f"preload={object_slide_request['preload_m'] * 1.0e3:.2f}mm"
             )
 
         if shared.consume_reset():
@@ -2167,8 +2827,11 @@ def main():
             object_slide_trial = None
 
             obs, _ = env.reset()
+            print(f"[HydroShear] elastomer sources: {hydroshear_elastomer_source_summary(env)}", flush=True)
+            prev_debug_hydro_relative_poses = _read_hydro_relative_poses(env)
             for _ in range(warmup_steps):
                 obs, _, _, _, _ = env.step(init_joint_pos)
+                prev_debug_hydro_relative_poses = _read_hydro_relative_poses(env)
 
             left_pos = left_ee_target_pos.copy()
             right_pos = right_ee_target_pos.copy()
@@ -2211,6 +2874,24 @@ def main():
         left_ee_quat_fk = left_ik.get_ee_quat()
         right_ee_fk = right_ik.get_ee_pos()
         right_ee_quat_fk = right_ik.get_ee_quat()
+
+        if object_slide_trial is not None and object_slide_trial.get("robot_hold_action") is None:
+            hold_action = env._robot.data.joint_pos[0, left_ik._dataset_joint_ids].detach().cpu().numpy().astype(np.float32)
+            object_slide_trial["robot_hold_action"] = hold_action.copy()
+            left_target_pos = left_ee_fk.astype(np.float32, copy=True)
+            left_target_quat = left_ee_quat_fk.astype(np.float32, copy=True)
+            right_target_pos = right_ee_fk.astype(np.float32, copy=True)
+            right_target_quat = right_ee_quat_fk.astype(np.float32, copy=True)
+            shared.set_target("left", *[float(v) for v in left_target_pos])
+            shared.set_target_quat("left", *[float(v) for v in left_target_quat])
+            shared.set_target("right", *[float(v) for v in right_target_pos])
+            shared.set_target_quat("right", *[float(v) for v in right_target_quat])
+            if handles["left_ee_gizmo"] is not None:
+                handles["left_ee_gizmo"].position = tuple(float(v) for v in left_target_pos)
+                handles["left_ee_gizmo"].wxyz = tuple(float(v) for v in left_target_quat)
+            if handles["right_ee_gizmo"] is not None:
+                handles["right_ee_gizmo"].position = tuple(float(v) for v in right_target_pos)
+                handles["right_ee_gizmo"].wxyz = tuple(float(v) for v in right_target_quat)
 
         if controlled_trial is not None and str(controlled_trial.get("phase", "")) == "settle":
             trial_pad = int(controlled_trial.get("pad", -1))
@@ -2301,14 +2982,49 @@ def main():
                 remaining = int(object_slide_trial.get("settle_remaining", 0))
                 object_name = str(object_slide_trial.get("object_name", "plug"))
                 obj = env._socket_obj if object_name == "socket" else env._plug_obj
-                pose = get_rigid_object_pose_w(obj)
+                pose = None
+                wrote_preload_reference = False
+                wrote_first_preload_pose = False
+                if bool(object_slide_trial.get("auto_place", True)):
+                    pad_axes_w = _read_pad_axes_world(env, cfg)
+                    pad_axes = pad_axes_w.get(int(object_slide_trial["pad"]))
+                    preload_m = float(object_slide_trial.get("preload_m", 0.0))
+                    pose_preload_m = preload_m
+                    if preload_m > 0.0 and not bool(object_slide_trial.get("preload_reference_done", False)):
+                        pose_preload_m = 0.0
+                        object_slide_trial["preload_reference_done"] = True
+                        wrote_preload_reference = True
+                    elif preload_m > 0.0 and not bool(object_slide_trial.get("preload_pose_applied", False)):
+                        object_slide_trial["preload_pose_applied"] = True
+                        wrote_first_preload_pose = True
+                    contact_pose = (
+                        object_contact_pose_from_pad(
+                            pad_axes,
+                            cfg,
+                            pose_preload_m,
+                        )
+                        if pad_axes is not None
+                        else None
+                    )
+                    if contact_pose is not None:
+                        write_rigid_object_pose_w(obj, contact_pose[0], contact_pose[1])
+                        pose = contact_pose
+                if pose is None:
+                    pose = get_rigid_object_pose_w(obj)
                 if pose is not None:
                     object_slide_trial["object_pos_w"] = pose[0].copy()
                     object_slide_trial["object_quat_w"] = pose[1].copy()
-                if remaining > 0:
+                if wrote_preload_reference:
+                    trial_phase = "object_preload_reference"
+                elif wrote_first_preload_pose and remaining <= 0:
+                    object_slide_trial["settle_remaining"] = 1
+                    trial_phase = "object_preload_apply"
+                elif remaining > 0:
                     object_slide_trial["settle_remaining"] = remaining - 1
                 else:
-                    reset_tactile_state(env)
+                    zeroed = zero_hydroshear_shear_preserve_normal(env)
+                    if zeroed > 0:
+                        print(f"[HydroShear] Object slide zeroed shear state for {zeroed} core(s).", flush=True)
                     shared.set_shear_csv_recording(True)
                     handles["shear_csv_btn"].name = "Stop Shear CSV"
                     handles["shear_csv_btn"].color = "orange"
@@ -2368,6 +3084,14 @@ def main():
                 handles["shear_csv_btn"].color = "blue"
                 if path:
                     handles["state_md"].content = f"**Object slide CSV saved!** {os.path.basename(path)}"
+                    if auto_probe_pending_axis is not None:
+                        print(
+                            f"[AUTO] Object slide probe shear_{auto_probe_pending_axis} saved: {path}",
+                            flush=True,
+                        )
+                if auto_probe_pending_axis is not None:
+                    auto_probe_pending_axis = None
+                    auto_probe_complete = not auto_probe_axes
                 object_slide_trial = None
 
         if axis_jogs:
@@ -2429,9 +3153,12 @@ def main():
         elif last_axis_jog_segment is not None:
             update_axis_jog_arrow(handles, last_axis_jog_segment)
 
-        left_action = compute_pose(left_ik, left_target_pos, left_target_quat, left_gripper)
-        right_action = compute_pose(right_ik, right_target_pos, right_target_quat, right_gripper)
-        action = np.concatenate([left_action[:8], right_action[8:]], axis=0).astype(np.float32)
+        if object_slide_trial is not None and object_slide_trial.get("robot_hold_action") is not None:
+            action = np.asarray(object_slide_trial["robot_hold_action"], dtype=np.float32).copy()
+        else:
+            left_action = compute_pose(left_ik, left_target_pos, left_target_quat, left_gripper)
+            right_action = compute_pose(right_ik, right_target_pos, right_target_quat, right_gripper)
+            action = np.concatenate([left_action[:8], right_action[8:]], axis=0).astype(np.float32)
         obs, _, _, _, _ = env.step(action)
 
         left_ee = left_ik.get_ee_pos()
@@ -2440,6 +3167,38 @@ def main():
         right_ee_quat = right_ik.get_ee_quat()
         pad_axes_w = _read_pad_axes_world(env, cfg)
         update_tactile_axis_visuals(handles, pad_axes_w, visible=shared.is_show_tactile_axes())
+
+        curr_debug_hydro_relative_poses = _read_hydro_relative_poses(env)
+        debug_pad = commanded_pad
+        if debug_pad is None and object_slide_trial is not None:
+            debug_pad = int(object_slide_trial.get("pad", -1))
+        if debug_pad is None and controlled_trial is not None:
+            debug_pad = int(controlled_trial.get("pad", -1))
+        debug_hydro_delta = np.zeros(3, dtype=np.float64)
+        if debug_pad is not None:
+            curr_pose = curr_debug_hydro_relative_poses.get(int(debug_pad))
+            prev_pose = prev_debug_hydro_relative_poses.get(int(debug_pad))
+            if curr_pose is not None and prev_pose is not None:
+                debug_hydro_delta = np.asarray(curr_pose[0], dtype=np.float64) - np.asarray(prev_pose[0], dtype=np.float64)
+        debug_command_delta = commanded_object_delta_w + commanded_left_delta_w + commanded_right_delta_w
+        debug_text = update_hydroshear_debug_vectors(
+            handles,
+            obs,
+            pad_axes_w,
+            pad=None if debug_pad is None or int(debug_pad) < 0 else int(debug_pad),
+            command_delta_w=debug_command_delta,
+            hydro_rel_delta_p=debug_hydro_delta,
+            visible=shared.is_show_tactile_axes(),
+        )
+        if handles.get("hydro_debug_md") is not None:
+            try:
+                handles["hydro_debug_md"].content = (
+                    f"**Vectors:** blue=command, orange=HydroShear relative motion, purple=force shear.  \n"
+                    f"**Current:** {debug_text}"
+                )
+            except Exception:
+                pass
+        prev_debug_hydro_relative_poses = curr_debug_hydro_relative_poses
 
         if recording:
             recorder.record(
@@ -2474,6 +3233,8 @@ def main():
                 socket_pose=obs.get("socket_pose"),
                 commanded_object_name=commanded_object_name,
                 commanded_object_delta_w=commanded_object_delta_w,
+                hydro_target_poses_w=_read_hydro_target_poses_world(env),
+                hydro_relative_poses=_read_hydro_relative_poses(env),
             )
 
         update_scene_fast(
@@ -2487,7 +3248,13 @@ def main():
             urdf_joint_names,
         )
 
-        if step % slow_interval == 0:
+        force_live_shear_refresh = bool(
+            WORKING_PROBE_DEMO
+            or shear_csv_recording
+            or object_slide_trial is not None
+            or controlled_trial is not None
+        )
+        if force_live_shear_refresh or step % slow_interval == 0:
             update_scene_slow(
                 handles,
                 obs,
@@ -2501,6 +3268,7 @@ def main():
                 shear_csv_recording,
                 shear_csv_recorder.num_frames,
                 shear_csv_recorder.num_rows,
+                hydroshear_elastomer_source_summary(env),
             )
 
         if step % 120 == 0:
@@ -2518,6 +3286,16 @@ def main():
                 f"{shear_csv_tag}",
                 flush=True,
             )
+
+        if (
+            auto_probe_complete
+            and not auto_probe_visual_demo
+            and object_slide_trial is None
+            and controlled_trial is None
+            and not shear_csv_recorder.active
+        ):
+            print("[AUTO] Object slide probe complete; exiting.", flush=True)
+            break
 
         step += 1
 
