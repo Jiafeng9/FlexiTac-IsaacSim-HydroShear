@@ -1,0 +1,266 @@
+[
+  {
+    "file": "bump_strip_4rows_8cols_extra_soft_hollow.stl",
+    "size_bytes": 2023884,
+    "faces": 40476,
+    "vertices": 20240,
+    "watertight": true,
+    "winding_consistent": true,
+    "euler_number": 2,
+    "extents_mm": [
+      73.25,
+      38.25,
+      6.73
+    ],
+    "bounds_min_mm": [
+      -36.625,
+      -19.125,
+      0.0
+    ],
+    "bounds_max_mm": [
+      36.625,
+      19.125,
+      6.73
+    ]
+  },
+  {
+    "file": "bump_strip_4rows_8cols_medium_hollow.stl",
+    "size_bytes": 2023884,
+    "faces": 40476,
+    "vertices": 20240,
+    "watertight": true,
+    "winding_consistent": true,
+    "euler_number": 2,
+    "extents_mm": [
+      73.25,
+      38.25,
+      6.73
+    ],
+    "bounds_min_mm": [
+      -36.625,
+      -19.125,
+      0.0
+    ],
+    "bounds_max_mm": [
+      36.625,
+      19.125,
+      6.73
+    ]
+  },
+  {
+    "file": "bump_strip_4rows_8cols_soft_hollow.stl",
+    "size_bytes": 2023884,
+    "faces": 40476,
+    "vertices": 20240,
+    "watertight": true,
+    "winding_consistent": true,
+    "euler_number": 2,
+    "extents_mm": [
+      73.25,
+      38.25,
+      6.73
+    ],
+    "bounds_min_mm": [
+      -36.625,
+      -19.125,
+      0.0
+    ],
+    "bounds_max_mm": [
+      36.625,
+      19.125,
+      6.73
+    ]
+  },
+  {
+    "file": "bump_strip_4rows_8cols_soft_hollow_relief_grooves.stl",
+    "size_bytes": 2048684,
+    "faces": 40972,
+    "vertices": 20488,
+    "watertight": true,
+    "winding_consistent": true,
+    "euler_number": 2,
+    "extents_mm": [
+      73.25,
+      38.25,
+      6.73
+    ],
+    "bounds_min_mm": [
+      -36.625,
+      -19.125,
+      0.0
+    ],
+    "bounds_max_mm": [
+      36.625,
+      19.125,
+      6.73
+    ]
+  },
+  {
+    "file": "bump_strip_4rows_8cols_solid_reference.stl",
+    "size_bytes": 811084,
+    "faces": 16220,
+    "vertices": 8112,
+    "watertight": true,
+    "winding_consistent": true,
+    "euler_number": 2,
+    "extents_mm": [
+      73.25,
+      38.25,
+      6.73
+    ],
+    "bounds_min_mm": [
+      -36.625,
+      -19.125,
+      0.0
+    ],
+    "bounds_max_mm": [
+      36.625,
+      19.125,
+      6.73
+    ]
+  },
+  {
+    "file": "bump_strip_8rows_16cols_extra_soft_hollow.stl",
+    "size_bytes": 8091084,
+    "faces": 161820,
+    "vertices": 80912,
+    "watertight": true,
+    "winding_consistent": true,
+    "euler_number": 2,
+    "extents_mm": [
+      143.25,
+      73.25,
+      6.73
+    ],
+    "bounds_min_mm": [
+      -71.625,
+      -36.625,
+      0.0
+    ],
+    "bounds_max_mm": [
+      71.625,
+      36.625,
+      6.73
+    ]
+  },
+  {
+    "file": "bump_strip_8rows_16cols_medium_hollow.stl",
+    "size_bytes": 8091084,
+    "faces": 161820,
+    "vertices": 80912,
+    "watertight": true,
+    "winding_consistent": true,
+    "euler_number": 2,
+    "extents_mm": [
+      143.25,
+      73.25,
+      6.73
+    ],
+    "bounds_min_mm": [
+      -71.625,
+      -36.625,
+      0.0
+    ],
+    "bounds_max_mm": [
+      71.625,
+      36.625,
+      6.73
+    ]
+  },
+  {
+    "file": "bump_strip_8rows_16cols_soft_hollow.stl",
+    "size_bytes": 8091084,
+    "faces": 161820,
+    "vertices": 80912,
+    "watertight": true,
+    "winding_consistent": true,
+    "euler_number": 2,
+    "extents_mm": [
+      143.25,
+      73.25,
+      6.73
+    ],
+    "bounds_min_mm": [
+      -71.625,
+      -36.625,
+      0.0
+    ],
+    "bounds_max_mm": [
+      71.625,
+      36.625,
+      6.73
+    ]
+  },
+  {
+    "file": "bump_strip_8rows_16cols_solid_reference.stl",
+    "size_bytes": 3239884,
+    "faces": 64796,
+    "vertices": 32400,
+    "watertight": true,
+    "winding_consistent": true,
+    "euler_number": 2,
+    "extents_mm": [
+      143.25,
+      73.25,
+      6.73
+    ],
+    "bounds_min_mm": [
+      -71.625,
+      -36.625,
+      0.0
+    ],
+    "bounds_max_mm": [
+      71.625,
+      36.625,
+      6.73
+    ]
+  },
+  {
+    "file": "open_face_mold_4rows_8cols.stl",
+    "size_bytes": 811084,
+    "faces": 16220,
+    "vertices": 8112,
+    "watertight": true,
+    "winding_consistent": true,
+    "euler_number": 2,
+    "extents_mm": [
+      83.25,
+      48.25,
+      7.23
+    ],
+    "bounds_min_mm": [
+      -41.625,
+      -24.125,
+      0.0
+    ],
+    "bounds_max_mm": [
+      41.625,
+      24.125,
+      7.23
+    ]
+  },
+  {
+    "file": "open_face_mold_8rows_16cols.stl",
+    "size_bytes": 3239884,
+    "faces": 64796,
+    "vertices": 32400,
+    "watertight": true,
+    "winding_consistent": true,
+    "euler_number": 2,
+    "extents_mm": [
+      153.25,
+      83.25,
+      7.23
+    ],
+    "bounds_min_mm": [
+      -76.625,
+      -41.625,
+      0.0
+    ],
+    "bounds_max_mm": [
+      76.625,
+      41.625,
+      7.23
+    ]
+  }
+]
