@@ -74,6 +74,17 @@ parser.add_argument(
     help="Optional HydroShear tangential stiffness override in --compare_hydro_normal mode.",
 )
 parser.add_argument(
+    "--use_bump_pad",
+    action="store_true",
+    help="Use the generated bump-pad ALOHA URDF instead of the flat-pad tactile URDF.",
+)
+parser.add_argument(
+    "--robot_urdf",
+    type=str,
+    default="",
+    help="Optional robot URDF override. Takes precedence over --use_bump_pad.",
+)
+parser.add_argument(
     "--force_flat_elastomer_sdf",
     action="store_true",
     help="Force HydroShear to use the flat patch SDF instead of the elastomer USD mesh SDF.",
@@ -177,10 +188,19 @@ def _jet_colormap(v: np.ndarray) -> np.ndarray:
     return (np.stack([r, g, b], axis=-1) * 255).astype(np.uint8)
 
 
+def _grid_vis_scale(grid: np.ndarray, scale: int) -> int:
+    grid = np.asarray(grid)
+    if grid.ndim < 2:
+        return int(scale)
+    min_cells = max(1, int(min(grid.shape[0], grid.shape[1])))
+    return max(int(scale), int(np.ceil(120.0 / float(min_cells))))
+
+
 def tactile_to_rgb(grid: np.ndarray, scale: int = 8, vmax: float | None = None) -> np.ndarray:
     from PIL import Image
 
     grid = tactile_normal_channel(grid)
+    scale = _grid_vis_scale(grid, scale)
     vmax = float(grid.max()) if vmax is None else float(vmax)
     normed = grid / (vmax + 1e-8) if vmax > 0 else np.zeros_like(grid)
     rgb = _jet_colormap(normed)
@@ -193,6 +213,7 @@ def positive_tactile_to_rgb(grid: np.ndarray, scale: int = 8, vmax: float | None
     from PIL import Image
 
     grid = np.asarray(grid)
+    scale = _grid_vis_scale(grid, scale)
     vmax = float(grid.max()) if vmax is None else float(vmax)
     normed = np.clip(grid / vmax, 0.0, 1.0) if vmax > 0 else np.zeros_like(grid)
     rgb = _jet_colormap(normed)
@@ -229,6 +250,8 @@ def tactile_marker_vector_uv(grid: np.ndarray | None) -> np.ndarray | None:
 def signed_tactile_to_rgb(grid: np.ndarray, scale: int = 8, vmax: float | None = None) -> np.ndarray:
     from PIL import Image
 
+    grid = np.asarray(grid)
+    scale = _grid_vis_scale(grid, scale)
     vmax = float(np.max(np.abs(grid))) if vmax is None else float(vmax)
     if vmax <= 0.0:
         rgb = np.full(grid.shape + (3,), 255, dtype=np.uint8)
@@ -250,17 +273,18 @@ def _label_rgb(img: np.ndarray, text: str) -> np.ndarray:
     from PIL import Image, ImageDraw, ImageFont
 
     pil = Image.fromarray(img)
-    draw = ImageDraw.Draw(pil)
     try:
         font = ImageFont.truetype("DejaVuSans.ttf", 14)
     except Exception:
         font = ImageFont.load_default()
     lines = str(text).splitlines()
     label_h = max(22, 18 * len(lines) + 4)
-    draw.rectangle((0, 0, pil.width, label_h), fill=(0, 0, 0))
+    labeled = Image.new("RGB", (pil.width, pil.height + label_h), (0, 0, 0))
+    labeled.paste(pil, (0, label_h))
+    draw = ImageDraw.Draw(labeled)
     for i, line in enumerate(lines):
         draw.text((5, 3 + 18 * i), line, fill=(255, 255, 255), font=font)
-    return np.asarray(pil)
+    return np.asarray(labeled)
 
 
 def _fmt_scalar(value: float) -> str:
@@ -498,11 +522,6 @@ class SharedState:
         self._reset_requested = False
         self._recording = False
         self._shear_csv_recording = False
-        self._show_tactile_axes = True
-        self._axis_jog_step = 0.0005
-        self._axis_jog_requests: list[tuple[int, str, float]] = []
-        self._axis_jog_demo: tuple[int, str, float, int] | None = None
-        self._controlled_trial_requests: list[dict] = []
         self._object_slide_trial_requests: list[dict] = []
 
     def set_target(self, arm: str, x, y, z):
@@ -564,63 +583,6 @@ class SharedState:
         with self._lock:
             return self._shear_csv_recording
 
-    def set_show_tactile_axes(self, v):
-        with self._lock:
-            self._show_tactile_axes = bool(v)
-
-    def is_show_tactile_axes(self):
-        with self._lock:
-            return self._show_tactile_axes
-
-    def set_axis_jog_step(self, step_m):
-        with self._lock:
-            self._axis_jog_step = max(0.0, float(step_m))
-
-    def get_axis_jog_step(self):
-        with self._lock:
-            return float(self._axis_jog_step)
-
-    def request_axis_jog(self, pad: int, axis: str, direction: float):
-        with self._lock:
-            self._axis_jog_requests.append((int(pad), str(axis), float(direction)))
-
-    def start_axis_jog_demo(self, pad: int, axis: str, direction: float, steps: int):
-        with self._lock:
-            self._axis_jog_demo = (int(pad), str(axis), float(direction), max(0, int(steps)))
-
-    def stop_axis_jog_demo(self):
-        with self._lock:
-            self._axis_jog_demo = None
-
-    def request_controlled_trial(
-        self,
-        pad: int,
-        axis: str,
-        direction: float,
-        distance_m: float,
-        step_m: float,
-        settle_steps: int,
-        hold_steps: int,
-    ):
-        with self._lock:
-            self._controlled_trial_requests.append(
-                {
-                    "pad": int(pad),
-                    "axis": str(axis),
-                    "direction": float(direction),
-                    "distance_m": max(0.0, float(distance_m)),
-                    "step_m": max(1.0e-6, float(step_m)),
-                    "settle_steps": max(0, int(settle_steps)),
-                    "hold_steps": max(1, int(hold_steps)),
-                }
-            )
-
-    def consume_controlled_trial_request(self):
-        with self._lock:
-            if not self._controlled_trial_requests:
-                return None
-            return self._controlled_trial_requests.pop(0)
-
     def request_object_slide_trial(
         self,
         pad: int,
@@ -653,18 +615,6 @@ class SharedState:
             if not self._object_slide_trial_requests:
                 return None
             return self._object_slide_trial_requests.pop(0)
-
-    def consume_axis_jogs(self):
-        with self._lock:
-            requests = list(self._axis_jog_requests)
-            self._axis_jog_requests.clear()
-            if self._axis_jog_demo is not None:
-                pad, axis, direction, remaining = self._axis_jog_demo
-                if remaining > 0:
-                    requests.append((pad, axis, direction))
-                    remaining -= 1
-                self._axis_jog_demo = (pad, axis, direction, remaining) if remaining > 0 else None
-            return requests
 
 
 shared = SharedState()
@@ -1332,136 +1282,61 @@ def create_viser_server(port: int, cfg=None):
         shear_csv_btn.name = "Start Shear CSV" if is_recording else "Stop Shear CSV"
         shear_csv_btn.color = "blue" if is_recording else "orange"
 
-    with server.gui.add_folder("Tactile Axis Jog", expand_by_default=False):
-        server.gui.add_markdown("Pad2 = right arm / left finger; Pad3 = right arm / right finger.")
-        show_tactile_axes = server.gui.add_checkbox("Show pad axes", initial_value=True)
-        jog_step_mm = server.gui.add_slider("Jog step (mm)", min=0.05, max=20.0, step=0.05, initial_value=0.5)
-        demo_steps = server.gui.add_slider("Demo steps", min=1, max=120, step=1, initial_value=40)
-        controlled_total_move_mm = server.gui.add_slider(
-            "Controlled total move (mm)",
+    with server.gui.add_folder("Object Slide CSV", expand_by_default=False):
+        object_total_move_mm = server.gui.add_slider(
+            "Total move (mm)",
             min=0.05,
             max=200.0,
             step=0.05,
             initial_value=2.0,
         )
-        controlled_settle_steps = server.gui.add_slider(
-            "Controlled settle steps",
+        object_step_mm = server.gui.add_slider("Step (mm)", min=0.05, max=20.0, step=0.05, initial_value=0.5)
+        object_settle_steps = server.gui.add_slider(
+            "Settle steps",
             min=0,
             max=240,
             step=1,
             initial_value=30,
         )
-        controlled_hold_steps = server.gui.add_slider(
-            "Controlled hold steps",
+        object_hold_steps = server.gui.add_slider(
+            "Hold steps",
             min=1,
             max=240,
             step=1,
             initial_value=40,
         )
-        pad2_xp = server.gui.add_button("Pad2 +shear_x")
-        pad2_xn = server.gui.add_button("Pad2 -shear_x")
-        pad2_yp = server.gui.add_button("Pad2 +shear_y")
-        pad2_yn = server.gui.add_button("Pad2 -shear_y")
-        pad3_xp = server.gui.add_button("Pad3 +shear_x")
-        pad3_xn = server.gui.add_button("Pad3 -shear_x")
-        pad3_yp = server.gui.add_button("Pad3 +shear_y")
-        pad3_yn = server.gui.add_button("Pad3 -shear_y")
-        demo_pad2_x = server.gui.add_button("Demo Pad2 +shear_x")
-        demo_pad2_y = server.gui.add_button("Demo Pad2 +shear_y")
-        stop_axis_demo = server.gui.add_button("Stop Axis Demo")
-        controlled_pad2_x = server.gui.add_button("Controlled Pad2 +shear_x CSV")
-        controlled_pad2_y = server.gui.add_button("Controlled Pad2 +shear_y CSV")
-        controlled_pad3_x = server.gui.add_button("Controlled Pad3 +shear_x CSV")
-        controlled_pad3_y = server.gui.add_button("Controlled Pad3 +shear_y CSV")
-        server.gui.add_markdown("Object slide moves the plug cube directly, without robot IK.")
-        object_auto_place = server.gui.add_checkbox("Object slide auto-place", initial_value=True)
+        object_auto_place = server.gui.add_checkbox("Auto-place", initial_value=True)
         object_preload_mm = server.gui.add_slider(
-            "Object preload (mm)",
+            "Preload (mm)",
             min=0.0,
             max=5.0,
             step=0.05,
             initial_value=1.0,
         )
-        object_pad2_x = server.gui.add_button("Object Slide Pad2 +shear_x CSV")
-        object_pad2_y = server.gui.add_button("Object Slide Pad2 +shear_y CSV")
-        object_pad3_x = server.gui.add_button("Object Slide Pad3 +shear_x CSV")
-        object_pad3_y = server.gui.add_button("Object Slide Pad3 +shear_y CSV")
+        object_pad2_x = server.gui.add_button("Pad2 +shear_x CSV")
+        object_pad2_y = server.gui.add_button("Pad2 +shear_y CSV")
+        object_pad3_x = server.gui.add_button("Pad3 +shear_x CSV")
+        object_pad3_y = server.gui.add_button("Pad3 +shear_y CSV")
 
-    @show_tactile_axes.on_update
-    def _(_):
-        shared.set_show_tactile_axes(bool(show_tactile_axes.value))
-
-    shared.set_show_tactile_axes(bool(show_tactile_axes.value))
-
-    @jog_step_mm.on_update
-    def _(_):
-        shared.set_axis_jog_step(float(jog_step_mm.value) * 1.0e-3)
-
-    shared.set_axis_jog_step(float(jog_step_mm.value) * 1.0e-3)
-
-    for button, pad, axis, direction in (
-        (pad2_xp, 2, "x", 1.0),
-        (pad2_xn, 2, "x", -1.0),
-        (pad2_yp, 2, "y", 1.0),
-        (pad2_yn, 2, "y", -1.0),
-        (pad3_xp, 3, "x", 1.0),
-        (pad3_xn, 3, "x", -1.0),
-        (pad3_yp, 3, "y", 1.0),
-        (pad3_yn, 3, "y", -1.0),
-    ):
-        @button.on_click
-        def _(_, pad=pad, axis=axis, direction=direction):
-            shared.request_axis_jog(pad, axis, direction)
-
-    @demo_pad2_x.on_click
-    def _(_):
-        shared.start_axis_jog_demo(2, "x", 1.0, int(demo_steps.value))
-
-    @demo_pad2_y.on_click
-    def _(_):
-        shared.start_axis_jog_demo(2, "y", 1.0, int(demo_steps.value))
-
-    @stop_axis_demo.on_click
-    def _(_):
-        shared.stop_axis_jog_demo()
-
-    for button, pad, axis in (
-        (controlled_pad2_x, 2, "x"),
-        (controlled_pad2_y, 2, "y"),
-        (controlled_pad3_x, 3, "x"),
-        (controlled_pad3_y, 3, "y"),
-    ):
-        @button.on_click
-        def _(_, pad=pad, axis=axis):
-            shared.request_controlled_trial(
-                pad,
-                axis,
-                1.0,
-                float(controlled_total_move_mm.value) * 1.0e-3,
-                float(jog_step_mm.value) * 1.0e-3,
-                int(controlled_settle_steps.value),
-                int(controlled_hold_steps.value),
-            )
-
-    for button, pad, axis in (
-        (object_pad2_x, 2, "x"),
-        (object_pad2_y, 2, "y"),
-        (object_pad3_x, 3, "x"),
-        (object_pad3_y, 3, "y"),
-    ):
-        @button.on_click
-        def _(_, pad=pad, axis=axis):
-            shared.request_object_slide_trial(
-                pad,
-                axis,
-                1.0,
-                float(controlled_total_move_mm.value) * 1.0e-3,
-                float(jog_step_mm.value) * 1.0e-3,
-                int(controlled_settle_steps.value),
-                int(controlled_hold_steps.value),
-                bool(object_auto_place.value),
-                float(object_preload_mm.value) * 1.0e-3,
-            )
+        for button, pad, axis in (
+            (object_pad2_x, 2, "x"),
+            (object_pad2_y, 2, "y"),
+            (object_pad3_x, 3, "x"),
+            (object_pad3_y, 3, "y"),
+        ):
+            @button.on_click
+            def _(_, pad=pad, axis=axis):
+                shared.request_object_slide_trial(
+                    pad,
+                    axis,
+                    1.0,
+                    float(object_total_move_mm.value) * 1.0e-3,
+                    float(object_step_mm.value) * 1.0e-3,
+                    int(object_settle_steps.value),
+                    int(object_hold_steps.value),
+                    bool(object_auto_place.value),
+                    float(object_preload_mm.value) * 1.0e-3,
+                )
 
     hydro_enabled = getattr(cfg.tactile, "enable_hydro_normal_observation", False)
     main_shear_enabled = bool(getattr(cfg.tactile.backend, "include_force_observations", False))
@@ -1578,34 +1453,6 @@ def create_viser_server(port: int, cfg=None):
         )
 
     server.scene.add_grid("/grid", width=2.0, height=2.0, position=(0.0, 0.0, -0.05))
-    tactile_axis_arrows = server.scene.add_arrows(
-        "/tactile_pad_axes",
-        points=np.zeros((12, 2, 3), dtype=np.float32),
-        colors=np.tile(
-            np.array(
-                [
-                    [0, 200, 255],   # shear_x
-                    [255, 150, 0],   # shear_y
-                    [0, 220, 80],    # normal
-                ],
-                dtype=np.uint8,
-            ),
-            (4, 1),
-        ),
-        shaft_radius=0.0015,
-        head_radius=0.004,
-        head_length=0.01,
-        visible=True,
-    )
-    axis_jog_arrow = server.scene.add_arrows(
-        "/tactile_axis_jog_target_delta",
-        points=np.zeros((1, 2, 3), dtype=np.float32),
-        colors=np.array([[0, 200, 255]], dtype=np.uint8),
-        shaft_radius=0.0025,
-        head_radius=0.006,
-        head_length=0.012,
-        visible=False,
-    )
     hydro_debug_arrows = server.scene.add_arrows(
         "/hydroshear_debug_vectors",
         points=np.zeros((3, 2, 3), dtype=np.float32),
@@ -1634,8 +1481,6 @@ def create_viser_server(port: int, cfg=None):
         "right_gripper_slider": right_slider,
         "record_btn": record_btn,
         "shear_csv_btn": shear_csv_btn,
-        "tactile_axis_arrows": tactile_axis_arrows,
-        "axis_jog_arrow": axis_jog_arrow,
         "hydro_debug_arrows": hydro_debug_arrows,
         "tac_handles": tac_handles,
         "hydro_handles": hydro_handles,
@@ -1786,53 +1631,6 @@ def _unit_vec(vec: np.ndarray) -> np.ndarray:
     if norm <= 1.0e-12:
         return np.zeros(3, dtype=np.float64)
     return vec / norm
-
-
-def update_tactile_axis_visuals(handles, pad_axes_w: dict[int, dict[str, np.ndarray]], *, visible: bool):
-    handle = handles.get("tactile_axis_arrows")
-    if handle is None:
-        return
-    axis_length = 0.035
-    normal_offset = 0.004
-    points = np.zeros((12, 2, 3), dtype=np.float32)
-    for pad in range(4):
-        axes = pad_axes_w.get(pad)
-        if axes is None:
-            continue
-        pos = np.asarray(axes.get("position_w", np.zeros(3)), dtype=np.float64).reshape(3)
-        normal = _unit_vec(axes.get("normal_w", np.zeros(3)))
-        axis_x = _unit_vec(axes.get("axis_x_w", np.zeros(3)))
-        axis_y = _unit_vec(axes.get("axis_y_w", np.zeros(3)))
-        origin = pos + normal * normal_offset
-        for j, direction in enumerate((axis_x, axis_y, normal)):
-            points[pad * 3 + j, 0] = origin.astype(np.float32)
-            points[pad * 3 + j, 1] = (origin + direction * axis_length).astype(np.float32)
-    try:
-        handle.points = points
-        handle.visible = bool(visible and pad_axes_w)
-    except Exception:
-        pass
-
-
-def update_axis_jog_arrow(handles, segment: tuple[np.ndarray, np.ndarray, str] | None):
-    handle = handles.get("axis_jog_arrow")
-    if handle is None:
-        return
-    if segment is None:
-        try:
-            handle.visible = False
-        except Exception:
-            pass
-        return
-    start, end, axis = segment
-    points = np.asarray([[start, end]], dtype=np.float32)
-    color = np.array([[0, 200, 255] if axis == "x" else [255, 150, 0]], dtype=np.uint8)
-    try:
-        handle.points = points
-        handle.colors = color
-        handle.visible = True
-    except Exception:
-        pass
 
 
 def _ratio_text(primary: float, secondary: float) -> str:
@@ -2553,6 +2351,10 @@ def main():
             device=str(getattr(args, "device", "cuda:0")),
         ),
     )
+    if args.robot_urdf:
+        cfg.robot.urdf_path = str(Path(os.path.expanduser(args.robot_urdf)).resolve())
+    elif bool(args.use_bump_pad):
+        cfg.robot.urdf_path = str((Path(__file__).resolve().parent / "assets" / "aloha_tactile_bump.urdf").resolve())
     cube_side = 0.026
     cube_size = (cube_side * 1.5, cube_side * 3.0, cube_side * 3.0)
     cube_z = cube_size[2] * 0.5 + 0.001
@@ -2571,13 +2373,17 @@ def main():
     if args.tactile_backend == "taxel_shear":
         cfg.tactile.backend = TaxelShearTactileBackendCfg()
     elif args.tactile_backend == "surface_hydro":
-        cfg.tactile.backend = HydroShearTactileBackendCfg(include_force_observations=True)
+        cfg.tactile.backend = HydroShearTactileBackendCfg(
+            include_force_observations=True,
+            bump_enabled=bool(args.use_bump_pad),
+        )
         cfg.tactile.backend.use_elastomer_mesh_sdf = not bool(args.force_flat_elastomer_sdf)
         cfg.tactile.backend.debug_print = True
     cfg.tactile.enable_hydro_normal_observation = bool(args.compare_hydro_normal)
     cfg.tactile.hydro_normal_backend.include_force_observations = bool(args.compare_hydro_normal)
     cfg.tactile.hydro_normal_backend.normal_readout_scale = float(args.hydro_normal_scale)
     cfg.tactile.hydro_normal_backend.shear_readout_scale = float(args.hydro_shear_scale)
+    cfg.tactile.hydro_normal_backend.bump_enabled = bool(args.use_bump_pad)
     cfg.tactile.hydro_normal_backend.use_elastomer_mesh_sdf = not bool(args.force_flat_elastomer_sdf)
     cfg.tactile.hydro_normal_backend.debug_print = bool(args.hydro_debug_print)
     if args.hydro_shear_stiffness is not None:
@@ -2669,7 +2475,6 @@ def main():
     slow_interval = max(1, int(args.slow_interval))
     was_recording = False
     was_shear_csv_recording = False
-    controlled_trial: dict | None = None
     object_slide_trial: dict | None = None
     auto_probe_axes: list[str] = []
     auto_probe_visual_demo = bool(WORKING_PROBE_DEMO)
@@ -2714,38 +2519,9 @@ def main():
                 handles["state_md"].content = f"**Shear CSV saved!** {os.path.basename(path)}"
         was_shear_csv_recording = shear_csv_recording
 
-        trial_request = shared.consume_controlled_trial_request()
-        if trial_request is not None:
-            object_slide_trial = None
-            if shear_csv_recorder.active:
-                shear_csv_recorder.stop()
-            shared.set_shear_csv_recording(False)
-            shear_csv_recording = False
-            handles["shear_csv_btn"].name = "Start Shear CSV"
-            handles["shear_csv_btn"].color = "blue"
-            was_shear_csv_recording = False
-            reset_tactile_state(env)
-            controlled_trial = {
-                **trial_request,
-                "phase": "settle",
-                "settle_remaining": int(trial_request["settle_steps"]),
-                "hold_remaining": 0,
-                "distance_remaining_m": float(trial_request["distance_m"]),
-                "left_target_pos_w": None,
-                "right_target_pos_w": None,
-            }
-            handles["state_md"].content = (
-                f"**Controlled trial armed:** pad{trial_request['pad']} "
-                f"shear_{trial_request['axis']} settle={trial_request['settle_steps']} "
-                f"move={trial_request['distance_m'] * 1.0e3:.2f}mm "
-                f"step={trial_request['step_m'] * 1.0e3:.2f}mm "
-                f"hold={trial_request['hold_steps']}"
-            )
-
         if (
             auto_probe_axes
             and auto_probe_pending_axis is None
-            and controlled_trial is None
             and object_slide_trial is None
             and not shear_csv_recorder.active
         ):
@@ -2775,7 +2551,6 @@ def main():
 
         object_slide_request = shared.consume_object_slide_trial_request()
         if object_slide_request is not None:
-            controlled_trial = None
             if shear_csv_recorder.active:
                 shear_csv_recorder.stop()
             shared.set_shear_csv_recording(False)
@@ -2823,7 +2598,6 @@ def main():
             shear_csv_recording = False
             was_recording = False
             was_shear_csv_recording = False
-            controlled_trial = None
             object_slide_trial = None
 
             obs, _ = env.reset()
@@ -2893,28 +2667,6 @@ def main():
                 handles["right_ee_gizmo"].position = tuple(float(v) for v in right_target_pos)
                 handles["right_ee_gizmo"].wxyz = tuple(float(v) for v in right_target_quat)
 
-        if controlled_trial is not None and str(controlled_trial.get("phase", "")) == "settle":
-            trial_pad = int(controlled_trial.get("pad", -1))
-            if trial_pad < 2:
-                left_target_pos = left_ee_fk.astype(np.float32, copy=True)
-                left_target_quat = left_ee_quat_fk.astype(np.float32, copy=True)
-                controlled_trial["left_target_pos_w"] = left_target_pos.astype(np.float64, copy=True)
-                shared.set_target("left", *[float(v) for v in left_target_pos])
-                shared.set_target_quat("left", *[float(v) for v in left_target_quat])
-                if handles["left_ee_gizmo"] is not None:
-                    handles["left_ee_gizmo"].position = tuple(float(v) for v in left_target_pos)
-                    handles["left_ee_gizmo"].wxyz = tuple(float(v) for v in left_target_quat)
-            else:
-                right_target_pos = right_ee_fk.astype(np.float32, copy=True)
-                right_target_quat = right_ee_quat_fk.astype(np.float32, copy=True)
-                controlled_trial["right_target_pos_w"] = right_target_pos.astype(np.float64, copy=True)
-                shared.set_target("right", *[float(v) for v in right_target_pos])
-                shared.set_target_quat("right", *[float(v) for v in right_target_quat])
-                if handles["right_ee_gizmo"] is not None:
-                    handles["right_ee_gizmo"].position = tuple(float(v) for v in right_target_pos)
-                    handles["right_ee_gizmo"].wxyz = tuple(float(v) for v in right_target_quat)
-
-        last_axis_jog_segment = None
         commanded_left_delta_w = np.zeros(3, dtype=np.float64)
         commanded_right_delta_w = np.zeros(3, dtype=np.float64)
         commanded_object_delta_w = np.zeros(3, dtype=np.float64)
@@ -2922,58 +2674,6 @@ def main():
         commanded_pad = None
         commanded_axis = ""
         trial_phase = ""
-        axis_jogs = shared.consume_axis_jogs()
-        if controlled_trial is not None:
-            phase = str(controlled_trial.get("phase", ""))
-            trial_phase = phase
-            if phase == "settle":
-                remaining = int(controlled_trial.get("settle_remaining", 0))
-                if remaining > 0:
-                    controlled_trial["settle_remaining"] = remaining - 1
-                else:
-                    reset_tactile_state(env)
-                    shared.set_shear_csv_recording(True)
-                    handles["shear_csv_btn"].name = "Stop Shear CSV"
-                    handles["shear_csv_btn"].color = "orange"
-                    controlled_trial["phase"] = "move_wait_csv"
-                    trial_phase = "move_wait_csv"
-            elif phase == "move_wait_csv":
-                if shear_csv_recorder.active:
-                    controlled_trial["phase"] = "move"
-                    trial_phase = "move"
-            elif phase == "move":
-                distance_remaining = float(controlled_trial.get("distance_remaining_m", 0.0))
-                hold_remaining = int(controlled_trial.get("hold_remaining", 0))
-                if hold_remaining > 0:
-                    controlled_trial["hold_remaining"] = hold_remaining - 1
-                    trial_phase = "hold"
-                elif distance_remaining > 1.0e-9:
-                    step_m = min(float(controlled_trial.get("step_m", 0.0)), distance_remaining)
-                    axis_jogs.append(
-                        (
-                            int(controlled_trial["pad"]),
-                            str(controlled_trial["axis"]),
-                            float(controlled_trial["direction"]),
-                            step_m,
-                            "controlled",
-                        )
-                    )
-                    controlled_trial["distance_remaining_m"] = max(0.0, distance_remaining - step_m)
-                    controlled_trial["hold_remaining"] = max(0, int(controlled_trial.get("hold_steps", 1)) - 1)
-                    trial_phase = "move"
-                else:
-                    controlled_trial["phase"] = "stop"
-                    trial_phase = "stop"
-            elif phase == "stop":
-                path = shear_csv_recorder.stop()
-                shared.set_shear_csv_recording(False)
-                shear_csv_recording = False
-                was_shear_csv_recording = False
-                handles["shear_csv_btn"].name = "Start Shear CSV"
-                handles["shear_csv_btn"].color = "blue"
-                if path:
-                    handles["state_md"].content = f"**Controlled shear CSV saved!** {os.path.basename(path)}"
-                controlled_trial = None
 
         if object_slide_trial is not None:
             phase = str(object_slide_trial.get("phase", ""))
@@ -3070,7 +2770,6 @@ def main():
                             commanded_object_delta_w += delta.astype(np.float64)
                             commanded_pad = pad
                             commanded_axis = axis
-                            last_axis_jog_segment = (start_pos, new_pos.copy(), axis)
                     trial_phase = "object_move"
                 else:
                     object_slide_trial["phase"] = "stop"
@@ -3094,65 +2793,6 @@ def main():
                     auto_probe_complete = not auto_probe_axes
                 object_slide_trial = None
 
-        if axis_jogs:
-            pad_axes_w = _read_pad_axes_world(env, cfg)
-            jog_step = shared.get_axis_jog_step()
-            for jog in axis_jogs:
-                pad, axis, direction = jog[:3]
-                step_m = float(jog[3]) if len(jog) >= 4 else float(jog_step)
-                jog_mode = str(jog[4]) if len(jog) >= 5 else ""
-                if step_m <= 0.0:
-                    continue
-                pad_axes = pad_axes_w.get(pad)
-                if pad_axes is None:
-                    continue
-                axis_key = "axis_x_w" if axis == "x" else "axis_y_w"
-                axis_vec = np.asarray(pad_axes.get(axis_key, np.zeros(3)), dtype=np.float32).reshape(3)
-                if not np.any(axis_vec):
-                    continue
-                delta = axis_vec * float(direction) * step_m
-                commanded_pad = int(pad)
-                commanded_axis = str(axis)
-                if pad < 2:
-                    if jog_mode == "controlled" and controlled_trial is not None:
-                        stored_target = controlled_trial.get("left_target_pos_w")
-                        start_pos = (
-                            left_ee_fk.astype(np.float64, copy=True)
-                            if stored_target is None
-                            else np.asarray(stored_target, dtype=np.float64).reshape(3)
-                        )
-                    else:
-                        start_pos = left_ee_fk.astype(np.float64, copy=True)
-                    left_target_pos = start_pos + delta.astype(np.float32)
-                    left_target_quat = left_ee_quat_fk.astype(np.float32, copy=True)
-                    shared.set_target("left", *[float(v) for v in left_target_pos])
-                    shared.set_target_quat("left", *[float(v) for v in left_target_quat])
-                    if jog_mode == "controlled" and controlled_trial is not None:
-                        controlled_trial["left_target_pos_w"] = left_target_pos.astype(np.float64, copy=True)
-                    commanded_left_delta_w += delta.astype(np.float64)
-                    last_axis_jog_segment = (start_pos, left_target_pos.copy(), axis)
-                else:
-                    if jog_mode == "controlled" and controlled_trial is not None:
-                        stored_target = controlled_trial.get("right_target_pos_w")
-                        start_pos = (
-                            right_ee_fk.astype(np.float64, copy=True)
-                            if stored_target is None
-                            else np.asarray(stored_target, dtype=np.float64).reshape(3)
-                        )
-                    else:
-                        start_pos = right_ee_fk.astype(np.float64, copy=True)
-                    right_target_pos = start_pos + delta.astype(np.float32)
-                    right_target_quat = right_ee_quat_fk.astype(np.float32, copy=True)
-                    shared.set_target("right", *[float(v) for v in right_target_pos])
-                    shared.set_target_quat("right", *[float(v) for v in right_target_quat])
-                    if jog_mode == "controlled" and controlled_trial is not None:
-                        controlled_trial["right_target_pos_w"] = right_target_pos.astype(np.float64, copy=True)
-                    commanded_right_delta_w += delta.astype(np.float64)
-                    last_axis_jog_segment = (start_pos, right_target_pos.copy(), axis)
-            update_axis_jog_arrow(handles, last_axis_jog_segment)
-        elif last_axis_jog_segment is not None:
-            update_axis_jog_arrow(handles, last_axis_jog_segment)
-
         if object_slide_trial is not None and object_slide_trial.get("robot_hold_action") is not None:
             action = np.asarray(object_slide_trial["robot_hold_action"], dtype=np.float32).copy()
         else:
@@ -3166,14 +2806,11 @@ def main():
         right_ee = right_ik.get_ee_pos()
         right_ee_quat = right_ik.get_ee_quat()
         pad_axes_w = _read_pad_axes_world(env, cfg)
-        update_tactile_axis_visuals(handles, pad_axes_w, visible=shared.is_show_tactile_axes())
 
         curr_debug_hydro_relative_poses = _read_hydro_relative_poses(env)
         debug_pad = commanded_pad
         if debug_pad is None and object_slide_trial is not None:
             debug_pad = int(object_slide_trial.get("pad", -1))
-        if debug_pad is None and controlled_trial is not None:
-            debug_pad = int(controlled_trial.get("pad", -1))
         debug_hydro_delta = np.zeros(3, dtype=np.float64)
         if debug_pad is not None:
             curr_pose = curr_debug_hydro_relative_poses.get(int(debug_pad))
@@ -3188,7 +2825,7 @@ def main():
             pad=None if debug_pad is None or int(debug_pad) < 0 else int(debug_pad),
             command_delta_w=debug_command_delta,
             hydro_rel_delta_p=debug_hydro_delta,
-            visible=shared.is_show_tactile_axes(),
+            visible=True,
         )
         if handles.get("hydro_debug_md") is not None:
             try:
@@ -3252,7 +2889,6 @@ def main():
             WORKING_PROBE_DEMO
             or shear_csv_recording
             or object_slide_trial is not None
-            or controlled_trial is not None
         )
         if force_live_shear_refresh or step % slow_interval == 0:
             update_scene_slow(
@@ -3291,7 +2927,6 @@ def main():
             auto_probe_complete
             and not auto_probe_visual_demo
             and object_slide_trial is None
-            and controlled_trial is None
             and not shear_csv_recorder.active
         ):
             print("[AUTO] Object slide probe complete; exiting.", flush=True)

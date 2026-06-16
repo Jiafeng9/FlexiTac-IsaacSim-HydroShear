@@ -15,7 +15,7 @@ from tactile.backend import (
     HydroShearTactileBackendCfg as CoreHydroShearTactileBackendCfg,
 )
 from tactile.elastomer import inverse_transform_points, quat_apply_wxyz, quat_conjugate_wxyz
-from tactile.hydroshear import SurfacePointHydroShearCfg
+from tactile.hydroshear import BumpHydroShearCfg, SurfacePointHydroShearCfg
 from tactile.readout import (
     HydroShearMarkerReadoutCfg,
     ProjectedSurfacePointTrackerCfg,
@@ -61,7 +61,7 @@ class HydroShearTactileBackendCfg:
     """ALOHA adapter config for the surface-point HydroShear tactile backend."""
 
     dilation_decay: float = 1.0
-    shear_decay: float = 1.0
+    shear_decay: float = 0.1
     E: float = 1.0
     K: float = 1.0
     A: float = 1.0
@@ -70,7 +70,7 @@ class HydroShearTactileBackendCfg:
     shear_stiffness: float | None = None
     friction_coefficient: float | None = None
     area_mode: str = "unit"
-    normal_motion_deadband: float = 0.0
+    normal_motion_deadband: float = 1.0e-6
     max_frame_displacement: float | None = None
     readout_ema_alpha: float = 1.0
     surface_point_count: int = 2048
@@ -79,6 +79,17 @@ class HydroShearTactileBackendCfg:
     surface_poisson_initial_num_points: int = 50_000
     taxel_surface_margin: float = 0.003
     taxel_surface_local_z_dir: float = -1.0
+    normal_direction: float | None = None
+    bump_enabled: bool = False
+    bump_rows: int = 4
+    bump_cols: int = 8
+    bump_center_source: str = "aloha_bump_pad"
+    bump_center_surface_band: float | None = None
+    bump_center_surface_band_ratio: float = 0.05
+    bump_contact_skin_depth: float | None = None
+    bump_normal_damping: float = 0.0
+    bump_aggregation_mode: str = "weighted_mean"
+    bump_reset_on_contact_loss: bool = True
     projected_displacement_lambda_d: float = 1.0
     projected_displacement_decay: float = 0.0
     projected_displacement_max: float | None = None
@@ -475,6 +486,17 @@ class HydroShearTactileBackend:
         self.device = device
         self._stage = None
 
+    def _output_grid_shape(self) -> tuple[int, int]:
+        if bool(getattr(self.backend_cfg, "bump_enabled", False)):
+            return int(self.backend_cfg.bump_rows), int(self.backend_cfg.bump_cols)
+        return int(self.tactile_cfg.num_rows), int(self.tactile_cfg.num_cols)
+
+    def _core_output_mode(self) -> str:
+        output_mode = str(getattr(self.backend_cfg, "output_mode", "force_grid"))
+        if bool(getattr(self.backend_cfg, "bump_enabled", False)) and output_mode == "marker_field":
+            return "bump_force_grid"
+        return output_mode
+
     def create_sensors(self, selected_links: list[str], target_query_paths: list[str]) -> tuple[list, list[int]]:
         sensors: list[HydroShearSensorState] = []
         slot_order: list[int] = []
@@ -502,7 +524,10 @@ class HydroShearTactileBackend:
             state.body_index = self._resolve_robot_body_index(state.link_path)
             state.samples = self._sample_target_mesh(stage, state.target_query_path, sensor_index=i)
             state.elastomer_vertices_p, state.elastomer_faces = self._sample_elastomer_mesh(stage, state)
-            state.taxel_positions_p = self._sample_elastomer_taxel_points(state)
+            if bool(getattr(self.backend_cfg, "bump_enabled", False)):
+                state.taxel_positions_p = None
+            else:
+                state.taxel_positions_p = self._sample_elastomer_taxel_points(state)
             state.core = self._make_core_backend(
                 slot=state.slot,
                 elastomer_vertices_p=state.elastomer_vertices_p,
@@ -593,8 +618,7 @@ class HydroShearTactileBackend:
         sensors.clear()
 
     def observations(self, sensors: list[HydroShearSensorState], sensor_slot_order: list[int]) -> dict[str, np.ndarray]:
-        tactile_cfg = self.tactile_cfg
-        rows, cols = tactile_cfg.num_rows, tactile_cfg.num_cols
+        rows, cols = self._output_grid_shape()
         primary_shape = _hydroshear_primary_shape(self.backend_cfg, rows, cols)
         num_envs = max((len(state.last_outputs or ([state.last_output] if state.last_output is not None else [])) for state in sensors), default=1)
         batched = num_envs > 1
@@ -610,6 +634,11 @@ class HydroShearTactileBackend:
         tactile_marker = np.zeros(force_shape, dtype=np.float32) if include_marker else None
         tactile_marker_dilation = np.zeros(force_shape, dtype=np.float32) if include_marker else None
         tactile_marker_shear = np.zeros(force_shape, dtype=np.float32) if include_marker else None
+        scalar_shape = (num_envs, 4) if batched else (4,)
+        contact_count = np.zeros(scalar_shape, dtype=np.float32)
+        bump_contact_count = np.zeros(scalar_shape, dtype=np.float32)
+        max_penetration = np.zeros(scalar_shape, dtype=np.float32)
+        min_sdf = np.zeros(scalar_shape, dtype=np.float32)
 
         for i, state in enumerate(sensors):
             outputs = state.last_outputs or ([state.last_output] if state.last_output is not None else [])
@@ -632,8 +661,22 @@ class HydroShearTactileBackend:
                         out.observations[f"{self.output_key}_marker_shear"],
                         shape=(rows, cols, 3),
                     )
+                contact_count[index] = float(out.contact.contact_mask.sum().detach().cpu())
+                if out.bump_surface is not None:
+                    bump_contact_count[index] = float(out.bump_surface.contact_mask.sum().detach().cpu())
+                    max_penetration[index] = float(out.bump_surface.penetration.max().detach().cpu())
+                else:
+                    bump_contact_count[index] = contact_count[index]
+                    max_penetration[index] = float(out.contact.penetration.max().detach().cpu())
+                min_sdf[index] = float(out.contact.sdf.min().detach().cpu())
 
-        obs = {self.output_key: tactile}
+        obs = {
+            self.output_key: tactile,
+            f"{self.output_key}_contact_count": contact_count,
+            f"{self.output_key}_bump_contact_count": bump_contact_count,
+            f"{self.output_key}_max_penetration": max_penetration,
+            f"{self.output_key}_min_sdf": min_sdf,
+        }
         if include_force:
             obs[f"{self.output_key}_force"] = tactile_force
             obs[f"{self.output_key}_shear"] = tactile_shear
@@ -654,6 +697,7 @@ class HydroShearTactileBackend:
     ) -> CoreHydroShearTactileBackend:
         tactile_cfg = self.tactile_cfg
         backend_cfg = self.backend_cfg
+        rows, cols = self._output_grid_shape()
         normal_stiffness, shear_stiffness, friction_coefficient = self._official_force_params(backend_cfg)
         normal_weight_by_penetration = bool(backend_cfg.normal_projection_weight_by_penetration)
         shear_weight_by_penetration = bool(backend_cfg.shear_projection_weight_by_penetration)
@@ -661,11 +705,21 @@ class HydroShearTactileBackend:
             normal_weight_by_penetration = bool(backend_cfg.projection_weight_by_penetration)
             shear_weight_by_penetration = bool(backend_cfg.projection_weight_by_penetration)
         shear_axis_signs = self._shear_axis_signs_for_slot(slot)
+        normal_direction = self._normal_direction(backend_cfg)
+        bump_contact_skin_depth = backend_cfg.bump_contact_skin_depth
+        if bump_contact_skin_depth is None:
+            bump_contact_skin_depth = abs(float(tactile_cfg.normal_offset))
+        bump_centers_p = self._bump_centers_p_for_backend(
+            backend_cfg,
+            tactile_cfg,
+            elastomer_vertices_p,
+            normal_direction=normal_direction,
+        )
         elastomer_sdf_name = elastomer_sdf_object_name or f"elastomer_{slot if slot is not None else 0}"
         cfg = CoreHydroShearTactileBackendCfg(
             grid=TaxelGridCfg(
-                num_rows=tactile_cfg.num_rows,
-                num_cols=tactile_cfg.num_cols,
+                num_rows=rows,
+                num_cols=cols,
                 point_distance=tactile_cfg.point_distance,
                 normal_axis=tactile_cfg.normal_axis,
                 normal_offset=tactile_cfg.normal_offset,
@@ -684,9 +738,32 @@ class HydroShearTactileBackend:
                 shear_stiffness=shear_stiffness,
                 friction_coefficient=friction_coefficient,
                 normal_axis=tactile_cfg.normal_axis,
+                normal_direction=normal_direction,
                 area_mode=backend_cfg.area_mode,
                 normal_decay=backend_cfg.dilation_decay,
                 shear_decay=backend_cfg.shear_decay,
+                motion_deadband=backend_cfg.normal_motion_deadband,
+                max_frame_displacement=backend_cfg.max_frame_displacement,
+            ),
+            bump=BumpHydroShearCfg(
+                enabled=bool(getattr(backend_cfg, "bump_enabled", False)),
+                num_rows=rows,
+                num_cols=cols,
+                centers_p=bump_centers_p,
+                center_source=backend_cfg.bump_center_source,
+                center_surface_band=backend_cfg.bump_center_surface_band,
+                center_surface_band_ratio=backend_cfg.bump_center_surface_band_ratio,
+                normal_stiffness=normal_stiffness,
+                normal_damping=float(backend_cfg.bump_normal_damping),
+                shear_stiffness=shear_stiffness,
+                friction_coefficient=friction_coefficient,
+                normal_axis=tactile_cfg.normal_axis,
+                normal_direction=normal_direction,
+                contact_skin_depth=float(bump_contact_skin_depth),
+                area_mode=backend_cfg.area_mode,
+                aggregation_mode=backend_cfg.bump_aggregation_mode,
+                shear_decay=backend_cfg.shear_decay,
+                reset_on_contact_loss=bool(backend_cfg.bump_reset_on_contact_loss),
                 motion_deadband=backend_cfg.normal_motion_deadband,
                 max_frame_displacement=backend_cfg.max_frame_displacement,
             ),
@@ -718,11 +795,70 @@ class HydroShearTactileBackend:
                 chunk_size=backend_cfg.projection_chunk_size,
                 sdf_query_chunk_size=backend_cfg.marker_sdf_query_chunk_size,
             ),
-            output_mode=backend_cfg.output_mode,
+            output_mode=self._core_output_mode(),
             readout_ema_alpha=backend_cfg.readout_ema_alpha,
             output_key=self.output_key,
         )
         return CoreHydroShearTactileBackend(cfg)
+
+    @staticmethod
+    def _bump_centers_p_for_backend(
+        backend_cfg,
+        tactile_cfg,
+        elastomer_vertices_p: torch.Tensor | None,
+        *,
+        normal_direction: float,
+    ) -> torch.Tensor | None:
+        if not bool(getattr(backend_cfg, "bump_enabled", False)):
+            return None
+        source = str(getattr(backend_cfg, "bump_center_source", "mesh_surface"))
+        if source == "mesh_surface":
+            return None
+        if source != "aloha_bump_pad":
+            raise ValueError("bump_center_source must be 'aloha_bump_pad' or 'mesh_surface'")
+        if elastomer_vertices_p is None:
+            raise RuntimeError("ALOHA bump center source requires elastomer_vertices_p")
+
+        vertices = torch.as_tensor(elastomer_vertices_p, dtype=torch.float32)
+        if vertices.ndim != 2 or vertices.shape[-1] != 3:
+            raise ValueError("elastomer_vertices_p must have shape (num_vertices, 3)")
+
+        normal_axis = int(tactile_cfg.normal_axis)
+        if normal_axis != 0:
+            raise ValueError("aloha_bump_pad center source expects ALOHA patch normal_axis=0; use mesh_surface otherwise")
+        tangent_axes = [0, 1, 2]
+        tangent_axes.remove(normal_axis)
+        axis_u, axis_v = tangent_axes
+        rows = int(backend_cfg.bump_rows)
+        cols = int(backend_cfg.bump_cols)
+
+        normal_values = vertices[:, normal_axis]
+
+        def axis_centers(count: int, target_extent_m: float) -> torch.Tensor:
+            if count <= 0:
+                raise ValueError("bump rows and cols must be positive")
+            # From bump_strip_generator.py / README: pitch=8.75 mm and
+            # base_radius + border = 4 mm + 2 mm on each side.
+            pitch_mm = 8.75
+            source_extent_mm = float(count - 1) * pitch_mm + 12.0
+            source_centers_mm = (torch.arange(count, dtype=vertices.dtype, device=vertices.device) - (count - 1) / 2.0) * pitch_mm
+            return source_centers_mm * (float(target_extent_m) / source_extent_mm)
+
+        u = axis_centers(rows, 0.026)
+        v = axis_centers(cols, 0.06665)
+        uu, vv = torch.meshgrid(u, v, indexing="ij")
+        centers = torch.zeros((rows * cols, 3), dtype=vertices.dtype, device=vertices.device)
+        centers[:, axis_u] = uu.reshape(-1)
+        centers[:, axis_v] = vv.reshape(-1)
+        centers[:, normal_axis] = normal_values.max() if normal_direction >= 0.0 else normal_values.min()
+        return centers
+
+    @staticmethod
+    def _normal_direction(backend_cfg) -> float:
+        normal_direction = getattr(backend_cfg, "normal_direction", None)
+        if normal_direction is None:
+            normal_direction = getattr(backend_cfg, "taxel_surface_local_z_dir", 1.0)
+        return 1.0 if float(normal_direction) >= 0.0 else -1.0
 
     @staticmethod
     def _official_force_params(backend_cfg) -> tuple[float, float, float]:
@@ -798,6 +934,7 @@ class HydroShearTactileBackend:
                     flush=True,
                 )
 
+        faces = _ensure_outward_triangle_winding(vertices_b, faces)
         vertices_b_t = torch.as_tensor(vertices_b, dtype=torch.float32, device=self.device)
         patch_pos_b = _to_tensor(state.patch_pos_b, device=self.device)
         patch_quat_b = _to_tensor(state.patch_quat_b, device=self.device)
@@ -877,6 +1014,24 @@ def _usd_mesh_vertices_faces(stage, mesh_prim_path: str) -> tuple[np.ndarray, np
     if vertices.size == 0 or not faces:
         raise RuntimeError(f"HydroShear target mesh has no triangles: {mesh_prim_path}")
     return vertices, np.asarray(faces, dtype=np.int64)
+
+
+def _ensure_outward_triangle_winding(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """Flip closed meshes with inward winding before building a signed SDF."""
+
+    vertices = np.asarray(vertices, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64)
+    if vertices.ndim != 2 or vertices.shape[-1] != 3 or faces.ndim != 2 or faces.shape[-1] != 3:
+        return faces
+    if faces.size == 0:
+        return faces
+    tri = vertices[faces]
+    signed_volume = float(np.einsum("ij,ij->i", tri[:, 0], np.cross(tri[:, 1], tri[:, 2])).sum() / 6.0)
+    bounds = vertices.max(axis=0) - vertices.min(axis=0)
+    scale_volume = float(np.prod(np.maximum(bounds, 1.0e-12)))
+    if signed_volume < -max(1.0e-15, 1.0e-6 * scale_volume):
+        return faces[:, [0, 2, 1]].copy()
+    return faces
 
 
 def _usd_mesh_vertices_faces_in_root(stage, root_prim_path: str) -> tuple[np.ndarray, np.ndarray]:
@@ -1117,7 +1272,15 @@ def _match_pose_batch(
 
 
 def _hydroshear_primary_shape(backend_cfg, rows: int, cols: int) -> tuple[int, ...]:
+    if getattr(backend_cfg, "bump_enabled", False):
+        output_mode = getattr(backend_cfg, "output_mode", "force_grid")
+        if output_mode == "marker_field":
+            output_mode = "bump_force_grid"
+        if output_mode == "bump_force_grid":
+            return (rows, cols, 3)
     if getattr(backend_cfg, "output_mode", "force_grid") == "marker_field":
+        return (rows, cols, 3)
+    if getattr(backend_cfg, "output_mode", "force_grid") == "bump_force_grid":
         return (rows, cols, 3)
     return (rows, cols)
 

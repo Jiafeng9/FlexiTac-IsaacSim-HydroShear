@@ -16,11 +16,12 @@ sys.path.insert(0, str(ROOT))
 os.environ.setdefault("MPLCONFIGDIR", str(ROOT / "output" / ".matplotlib"))
 
 from tactile.backend import HydroShearTactileBackend, HydroShearTactileBackendCfg  # noqa: E402
-from tactile.hydroshear import SurfacePointHydroShearCfg  # noqa: E402
+from tactile.hydroshear import BumpHydroShearCfg, SurfacePointHydroShearCfg  # noqa: E402
 from tactile.readout import (  # noqa: E402
     HydroShearMarkerReadoutCfg,
     SurfacePointForceProjectorCfg,
     TaxelGridCfg,
+    create_taxel_grid_points,
     tangential_axes,
 )
 from tactile.surface import ObjectSurfaceSamples  # noqa: E402
@@ -42,6 +43,13 @@ def parse_args():
     parser.add_argument("--slide", type=float, default=0.001)
     parser.add_argument("--lambda_s", type=float, default=10_800.0)
     parser.add_argument("--mu", type=float, default=10.0)
+    parser.add_argument(
+        "--use_bump",
+        "--use-bump",
+        action="store_true",
+        dest="use_bump",
+        help="Use the per-bump HydroShear state/readout.",
+    )
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -114,14 +122,18 @@ def make_slab_mesh(normal_axis: int):
 def make_backend(args) -> HydroShearTactileBackend:
     normal_axis = int(args.normal_axis)
     elastomer_vertices, elastomer_faces = make_slab_mesh(normal_axis)
+    grid_cfg = TaxelGridCfg(
+        num_rows=int(args.num_rows),
+        num_cols=int(args.num_cols),
+        point_distance=float(args.point_distance),
+        normal_axis=normal_axis,
+        normal_offset=float(args.normal_offset),
+    )
+    use_bump = bool(getattr(args, "use_bump", False))
+    bump_centers = create_taxel_grid_points(grid_cfg) if use_bump else None
     cfg = HydroShearTactileBackendCfg(
-        grid=TaxelGridCfg(
-            num_rows=int(args.num_rows),
-            num_cols=int(args.num_cols),
-            point_distance=float(args.point_distance),
-            normal_axis=normal_axis,
-            normal_offset=float(args.normal_offset),
-        ),
+        grid=grid_cfg,
+        taxel_positions_p=bump_centers if use_bump else None,
         elastomer_vertices_p=elastomer_vertices,
         elastomer_faces=elastomer_faces,
         elastomer_sdf_object_name=f"axis_probe_slab_{normal_axis}",
@@ -130,6 +142,17 @@ def make_backend(args) -> HydroShearTactileBackend:
             shear_stiffness=1.0,
             friction_coefficient=float(args.mu),
             normal_axis=normal_axis,
+        ),
+        bump=BumpHydroShearCfg(
+            enabled=use_bump,
+            num_rows=int(args.num_rows),
+            num_cols=int(args.num_cols),
+            centers_p=bump_centers,
+            normal_stiffness=1.0,
+            shear_stiffness=1.0,
+            friction_coefficient=float(args.mu),
+            normal_axis=normal_axis,
+            normal_direction=1.0,
         ),
         projection=SurfacePointForceProjectorCfg(
             lambda_s=float(args.lambda_s),
@@ -142,10 +165,29 @@ def make_backend(args) -> HydroShearTactileBackend:
             dilation_scale=0.0,
             shear_axis_signs=(1.0, 1.0),
         ),
-        output_mode="force_grid",
+        output_mode="bump_force_grid" if use_bump else "force_grid",
         output_key="tactile",
     )
     return HydroShearTactileBackend(cfg)
+
+
+def contact_shear_vectors_from_output(out) -> np.ndarray:
+    if out.bump_surface is not None:
+        bump = out.bump_surface
+        return bump.shear_force_e[bump.bump_ids].detach().cpu().numpy()
+    return out.surface.shear_force_e.detach().cpu().numpy()
+
+
+def bump_frame_fields_from_output(out) -> dict:
+    if out.bump_surface is None:
+        return {}
+    bump = out.bump_surface
+    return {
+        "bump_centers": bump.centers_p.detach().cpu().numpy(),
+        "bump_shear_e": bump.shear_force_e.detach().cpu().numpy(),
+        "bump_contact_mask": bump.contact_mask.detach().cpu().numpy(),
+        "bump_penetration": bump.penetration.detach().cpu().numpy(),
+    }
 
 
 def run_case(args, channel: int):
@@ -173,7 +215,7 @@ def run_case(args, channel: int):
     contact_points = out.contact.points_p.detach().cpu().numpy()
     contact_mask = out.contact.contact_mask.detach().cpu().numpy()
     penetration = out.contact.penetration.detach().cpu().numpy()
-    surface_shear_e = out.surface.shear_force_e.detach().cpu().numpy()
+    surface_shear_e = contact_shear_vectors_from_output(out)
 
     intended = float(np.mean(np.abs(shear_grid[..., channel])))
     leakage = float(np.mean(np.abs(shear_grid[..., 1 - channel])))
@@ -194,7 +236,7 @@ def run_case(args, channel: int):
         "contact_points": int(contact_mask.sum()),
         "max_penetration": float(np.max(penetration)),
     }
-    return {
+    result = {
         "channel": channel,
         "tangent": tangent,
         "move_axis": move_axis,
@@ -207,6 +249,8 @@ def run_case(args, channel: int):
         "surface_shear_e": surface_shear_e,
         "metrics": metrics,
     }
+    result.update(bump_frame_fields_from_output(out))
+    return result
 
 
 def _extent(taxel_points: np.ndarray, axis_u: int, axis_v: int):

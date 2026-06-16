@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import sys
 import tempfile
 import warnings
@@ -23,6 +24,7 @@ if str(TACTILE_ROOT) not in sys.path:
 
 from tactile.geometry import ObjectSurfaceSampler, ObjectSurfaceSamplerCfg  # noqa: E402
 from tactile.hydroshear import (  # noqa: E402
+    BumpHydroShearCfg,
     HydroShearTactileBackend,
     HydroShearTactileBackendCfg,
     SurfacePointHydroShearCfg,
@@ -43,8 +45,8 @@ OBJECT_ASSETS = {
     "torus": "torus_7mm.stl",
 }
 PROCEDURAL_OBJECTS = ("cylinder", "cube")
-GALLERY_OBJECTS = tuple(OBJECT_ASSETS)
 OBJECT_CHOICES = tuple(OBJECT_ASSETS) + PROCEDURAL_OBJECTS
+GALLERY_OBJECTS = OBJECT_CHOICES
 
 OBJECT_SCALES = {
     "sphere": 1.0,
@@ -69,6 +71,7 @@ OBJECT_THICKNESS_SCALES = {
 class DemoFrame:
     object_pose_p: np.ndarray
     marker_vectors_p: np.ndarray
+    bump_active_mask: np.ndarray | None = None
 
 
 @dataclass
@@ -83,6 +86,7 @@ class DemoScene:
     taxel_points_p: np.ndarray
     frames: list[DemoFrame]
     elastomer_pose_w: np.ndarray
+    normal_axis: int
 
 
 def parse_args(default_object: str = "sphere"):
@@ -101,7 +105,7 @@ def parse_args(default_object: str = "sphere"):
         default=None,
         help="Scale the object along the tactile normal axis. Cross defaults thicker for SDF robustness.",
     )
-    parser.add_argument("--gallery", action="store_true", help="Show sphere/cross/cow/torus in a 2x2 layout.")
+    parser.add_argument("--gallery", action="store_true", help="Show all built-in mesh and procedural objects together.")
     parser.add_argument("--cylinder-radius", type=float, default=0.0035)
     parser.add_argument("--cylinder-length", type=float, default=0.018)
     parser.add_argument("--cylinder-segments", type=int, default=64)
@@ -113,6 +117,11 @@ def parse_args(default_object: str = "sphere"):
     parser.add_argument("--num-rows", type=int, default=7)
     parser.add_argument("--num-cols", type=int, default=9)
     parser.add_argument("--taxel-margin", type=float, default=0.002)
+    parser.add_argument("--use-bump", action="store_true", help="Use the per-bump HydroShear state/readout.")
+    parser.add_argument("--bump-visual-radius", type=float, default=0.00045, help="Rendered bump marker radius for --use-bump.")
+    parser.add_argument("--bump-visual-height", type=float, default=0.00065, help="Rendered bump marker offset for --use-bump.")
+    parser.add_argument("--bump-active-color", type=str, default="tomato", help="Rendered color for contacted bumps.")
+    parser.add_argument("--bump-idle-color", type=str, default="deepskyblue", help="Rendered color for inactive bumps.")
     parser.add_argument("--local-z-dir", type=float, default=-1.0, choices=(-1.0, 1.0))
     parser.add_argument(
         "--normal-mode",
@@ -122,15 +131,20 @@ def parse_args(default_object: str = "sphere"):
     )
     parser.add_argument("--penetration", type=float, default=0.0015)
     parser.add_argument("--clearance", type=float, default=0.0015)
-    parser.add_argument("--slide-x", type=float, default=-5.0e-4)
-    parser.add_argument("--slide-y", type=float, default=-3.0e-4)
+    parser.add_argument("--slide-x", type=float, default=-1.2e-3)
+    parser.add_argument("--slide-y", type=float, default=-1.2e-3)
     parser.add_argument(
         "--motion-script",
         choices=("press_slide", "press_left_right_spin", "press_four_way_spin"),
         default="press_slide",
         help="Object motion sequence used by --animate/--gif.",
     )
-    parser.add_argument("--object-spin-deg", type=float, default=0.0, help="Rotate the object over the animation.")
+    parser.add_argument(
+        "--object-spin-deg",
+        type=float,
+        default=None,
+        help="Rotate the object over the animation. Spin motion scripts default to 180 degrees.",
+    )
     parser.add_argument(
         "--object-spin-axis",
         choices=("normal", "long", "x", "y", "z"),
@@ -521,17 +535,7 @@ def _motion_states(
             press,
             prev,
         ]
-        key_spins = [
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            float(spin_degrees),
-            float(spin_degrees),
-        ]
+        key_spins = [float(spin_degrees) * t for t in key_times]
         return _interpolate_keyframes(
             key_times=key_times,
             key_positions=key_positions,
@@ -543,13 +547,19 @@ def _motion_states(
     right = press + delta
     key_times = np.array([0.0, 0.16, 0.36, 0.56, 0.70, 0.90, 1.0], dtype=np.float64)
     key_positions = [prev, press, left, right, press, press, prev]
-    key_spins = [0.0, 0.0, 0.0, 0.0, 0.0, float(spin_degrees), float(spin_degrees)]
+    key_spins = [float(spin_degrees) * t for t in key_times]
     return _interpolate_keyframes(
         key_times=key_times,
         key_positions=key_positions,
         key_spins=key_spins,
         frame_count=frame_count,
     )
+
+
+def _resolved_object_spin_deg(args) -> float:
+    if args.object_spin_deg is not None:
+        return float(args.object_spin_deg)
+    return 180.0 if str(args.motion_script).endswith("_spin") else 0.0
 
 
 def _channels_to_vectors(marker_field: torch.Tensor, normal_axis: int) -> np.ndarray:
@@ -658,6 +668,16 @@ def _build_scene(args, object_name: str) -> DemoScene:
                 normal_direction=float(args.local_z_dir),
                 area_mode="unit",
             ),
+            bump=BumpHydroShearCfg(
+                enabled=bool(args.use_bump),
+                num_rows=int(args.num_rows),
+                num_cols=int(args.num_cols),
+                centers_p=torch.as_tensor(taxel_points, dtype=torch.float32),
+                friction_coefficient=float(args.mu),
+                normal_axis=normal_axis,
+                normal_direction=float(args.local_z_dir),
+                area_mode="unit",
+            ),
             projected_surface=ProjectedSurfacePointTrackerCfg(lambda_d=float(args.lambda_d)),
             projection=SurfacePointForceProjectorCfg(lambda_s=float(args.lambda_s)),
             marker_projection=HydroShearMarkerReadoutCfg(
@@ -667,10 +687,12 @@ def _build_scene(args, object_name: str) -> DemoScene:
                 dilation_scale=float(args.dilation_scale),
                 sdf_query_chunk_size=64,
             ),
-            output_mode="marker_field",
+            output_mode="bump_force_grid" if bool(args.use_bump) else "marker_field",
             output_key="tactile",
         )
     )
+    if bool(args.use_bump) and str(args.arrow_source) != "force":
+        print("[HydroShear demo] bump mode uses force-grid arrows because marker fields are surface-only.", flush=True)
 
     prev_pos, press_pos, slide_pos = _object_pose_sequence(
         object_vertices=object_vertices,
@@ -690,7 +712,7 @@ def _build_scene(args, object_name: str) -> DemoScene:
             slide_pos,
             frame_count=max(1, int(args.frames)),
             script=str(args.motion_script),
-            spin_degrees=float(args.object_spin_deg),
+            spin_degrees=_resolved_object_spin_deg(args),
         )
     else:
         motion_states = [(prev_pos, 0.0), (press_pos, 0.0), (slide_pos, 0.0)]
@@ -705,15 +727,25 @@ def _build_scene(args, object_name: str) -> DemoScene:
             object_pos_e=torch.as_tensor(pos, dtype=torch.float32),
             object_quat_e=object_quat,
         )
-        if str(args.arrow_source) == "force":
+        arrow_source = "force" if bool(args.use_bump) else str(args.arrow_source)
+        if arrow_source == "force":
             marker_vectors = _shear_uv_to_vectors(output.readout.tactile_shear, normal_axis)
-        elif str(args.arrow_source) == "marker_shear":
+        elif arrow_source == "marker_shear":
             marker_vectors = _channels_to_vectors(output.marker_readout.shear_field, normal_axis)
             marker_vectors[:, normal_axis] = 0.0
         else:
             marker_vectors = _channels_to_vectors(output.marker_readout.marker_field, normal_axis)
             marker_vectors[:, normal_axis] = 0.0
-        frames.append(DemoFrame(object_pose_p=_make_pose(pos, object_rot), marker_vectors_p=marker_vectors))
+        bump_active_mask = None
+        if output.bump_surface is not None:
+            bump_active_mask = output.bump_surface.contact_mask.detach().cpu().numpy().astype(bool)
+        frames.append(
+            DemoFrame(
+                object_pose_p=_make_pose(pos, object_rot),
+                marker_vectors_p=marker_vectors,
+                bump_active_mask=bump_active_mask,
+            )
+        )
 
     elastomer_pose_w = _make_pose(np.array([0.0, -0.06, -0.01]), _rot_x(180.0))
     return DemoScene(
@@ -727,6 +759,7 @@ def _build_scene(args, object_name: str) -> DemoScene:
         taxel_points_p=taxel_points,
         frames=frames,
         elastomer_pose_w=elastomer_pose_w,
+        normal_axis=normal_axis,
     )
 
 
@@ -756,16 +789,46 @@ def _frame_actors(vedo, pose: np.ndarray, *, size: float = 0.003):
     return actors
 
 
+def _bump_top_points_p(scene: DemoScene, args) -> np.ndarray:
+    points = np.asarray(scene.taxel_points_p, dtype=np.float64)
+    if not bool(args.use_bump):
+        return points
+    offset = np.zeros(3, dtype=np.float64)
+    offset[int(scene.normal_axis)] = float(args.local_z_dir) * float(args.bump_visual_height)
+    return points + offset.reshape(1, 3)
+
+
+def _bump_marker_actors(vedo, scene: DemoScene, frame: DemoFrame, args) -> list:
+    if not bool(args.use_bump):
+        return []
+    radius = max(float(args.bump_visual_radius), 1.0e-8)
+    points_w = _transform_points(_bump_top_points_p(scene, args), scene.elastomer_pose_w)
+    active_mask = frame.bump_active_mask
+    if active_mask is None or active_mask.shape[0] != points_w.shape[0]:
+        active_mask = np.zeros(points_w.shape[0], dtype=bool)
+    actors = []
+    for point, active in zip(points_w, active_mask, strict=True):
+        color = str(args.bump_active_color) if bool(active) else str(args.bump_idle_color)
+        alpha = 0.92 if bool(active) else 0.35
+        try:
+            sphere = vedo.Sphere(pos=point, r=radius, c=color, alpha=alpha, res=10)
+        except TypeError:
+            sphere = vedo.Sphere(pos=point, r=radius).c(color).alpha(alpha)
+        actors.append(sphere)
+    return actors
+
+
 def _shear_arrow_actors(vedo, scene: DemoScene, frame: DemoFrame, args):
-    starts_w = _transform_points(scene.taxel_points_p, scene.elastomer_pose_w)
+    starts_w = _transform_points(_bump_top_points_p(scene, args), scene.elastomer_pose_w)
     vectors_w = frame.marker_vectors_p @ scene.elastomer_pose_w[:3, :3].T
     norms = np.linalg.norm(vectors_w, axis=1)
-    if bool(args.normalize_arrows):
+    normalize_arrows = bool(args.normalize_arrows) or bool(args.use_bump)
+    if normalize_arrows:
         scale = 0.0 if norms.max(initial=0.0) <= 1.0e-12 else float(args.arrow_length) / float(norms.max())
     else:
         scale = float(args.arrow_scale)
 
-    min_norm = 1.0e-12 if bool(args.normalize_arrows) else 1.0e-6
+    min_norm = 1.0e-12 if normalize_arrows else 1.0e-6
     arrows = []
     for start, vec, norm in zip(starts_w, vectors_w, norms, strict=True):
         if norm <= min_norm:
@@ -791,8 +854,10 @@ def _actors_for_scene(vedo, scene: DemoScene, args, frame: DemoFrame | None = No
         ),
     ]
     actors.extend(_frame_actors(vedo, object_pose_w))
+    actors.extend(_bump_marker_actors(vedo, scene, frame, args))
     actors.extend(_shear_arrow_actors(vedo, scene, frame, args))
-    actors.append(vedo.Text2D(scene.object_name.capitalize(), pos="top-left", s=0.9, c="black"))
+    mode = "Bump HydroShear" if bool(args.use_bump) else "HydroShear"
+    actors.append(vedo.Text2D(f"{mode}: {scene.object_name.capitalize()}", pos="top-left", s=0.9, c="black"))
     return actors
 
 
@@ -817,8 +882,7 @@ def _set_camera(plotter, *, orbit_degrees: float = 0.0):
 
 
 def _show_static(vedo, scenes: list[DemoScene], args) -> None:
-    shape = (2, 2) if args.gallery else (1, 1)
-    plotter = vedo.Plotter(shape=shape, size=(1100, 900) if args.gallery else (900, 760), bg="white", axes=0)
+    plotter = vedo.Plotter(shape=_plot_shape(len(scenes)), size=_plot_size(len(scenes)), bg="white", axes=0)
     for idx, scene in enumerate(scenes):
         plotter.at(idx)
         for actor in _actors_for_scene(vedo, scene, args):
@@ -837,11 +901,18 @@ def _show_static(vedo, scenes: list[DemoScene], args) -> None:
 
 
 def _plot_shape(scene_count: int) -> tuple[int, int]:
-    return (2, 2) if scene_count > 1 else (1, 1)
+    if int(scene_count) <= 1:
+        return (1, 1)
+    cols = min(3, int(math.ceil(math.sqrt(float(scene_count)))))
+    rows = int(math.ceil(float(scene_count) / float(cols)))
+    return rows, cols
 
 
 def _plot_size(scene_count: int) -> tuple[int, int]:
-    return (1100, 900) if scene_count > 1 else (900, 760)
+    rows, cols = _plot_shape(scene_count)
+    if int(scene_count) <= 1:
+        return (900, 760)
+    return max(900, 500 * cols), max(760, 390 * rows)
 
 
 def _draw_scene_frame(

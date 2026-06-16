@@ -18,6 +18,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Viser HydroShear demo using the local tactile implementation.")
     parser.add_argument("--complex", action="store_true", help="Use a cube mesh object.")
     parser.add_argument("--channel", type=int, default=0, choices=(0, 1), help="Tangential shear channel to drive.")
+    parser.add_argument("--use-bump", action="store_true", help="Use the per-bump HydroShear state/readout.")
     parser.add_argument("--normal_axis", type=int, default=0)
     parser.add_argument("--num_points", type=int, default=2048, help="Object surface sample count for complex mode.")
     parser.add_argument("--slide", type=float, default=0.004)
@@ -90,7 +91,10 @@ def _add_frame(server, frame: dict, *, channel: int, handles: list) -> None:
     handles.append(
         server.scene.add_label(
             "/label",
-            text=f"HydroShear step={frame['step']} phase={frame['phase']} channel={channel}",
+            text=(
+                f"{'Bump HydroShear' if 'bump_shear_e' in frame else 'HydroShear'} "
+                f"step={frame['step']} phase={frame['phase']} channel={channel}"
+            ),
             position=(0.0, 0.0, 0.035),
         )
     )
@@ -106,6 +110,7 @@ def main():
         num_points=int(args.num_points),
         slide=float(args.slide),
         penetration=float(args.penetration),
+        use_bump=bool(args.use_bump),
     )
 
     server = viser.ViserServer(port=int(args.port))

@@ -127,6 +127,36 @@ Replay options:
 - `--tactile_backend surface_hydro`: use the surface-point HydroShear marker-field backend.
 - `--compare_hydro_normal`: additionally show a HydroShear output beside the selected main tactile backend.
 
+## HydroShear Vedo GIF Demos
+
+Render the Vedo object gallery with the per-bump HydroShear readout and four-way rotating press motion:
+
+```bash
+/home/jiafeng/miniconda3/envs/tactile_isaaclab/bin/python scripts/demo/demo_vedo.py \
+    --gallery \
+    --use-bump \
+    --motion-script press_four_way_spin \
+    --frames 36 \
+    --fps 12 \
+    --num-points 100 \
+    --initial-samples 3000 \
+    --gif Isaacsim_tactile_env/output/hydroshear_gallery_bump_four_way_rotation.gif
+```
+
+Render the dragging/sliding bump demo with the same bump HydroShear backend:
+
+```bash
+/home/jiafeng/miniconda3/envs/tactile_isaaclab/bin/python scripts/demo/demo_vedo.py \
+    --gallery \
+    --use-bump \
+    --motion-script press_slide \
+    --frames 36 \
+    --fps 12 \
+    --num-points 100 \
+    --initial-samples 3000 \
+    --gif Isaacsim_tactile_env/output/hydroshear_gallery_bump_dragging.gif
+```
+
 ## 🦾 Launch the Interactive Web Interface
 
 Start the Viser-based teleoperation interface with the default WarpSDF normal tactile backend:
@@ -146,11 +176,21 @@ Start Viser with the surface-point HydroShear tactile backend:
     --tactile_backend surface_hydro
 ```
 
+Start Viser with the generated bump-pad gripper and per-bump HydroShear readout for interactive dragging:
+
+```bash
+./isaaclab.sh -p Isaacsim_tactile_env/viser_interface.py \
+    --enable_cameras \
+    --tactile_backend surface_hydro \
+    --use_bump_pad
+```
+
 Viser options:
 
 - `--tactile_backend normal`: use the original WarpSDF normal-force tactile grid.
 - `--tactile_backend taxel_shear`: use WarpSDF normal force plus a taxel-level shear baseline.
 - `--tactile_backend surface_hydro`: use the surface-point HydroShear marker-field backend.
+- `--use_bump_pad`: use the generated bump-pad ALOHA URDF and enable the per-bump HydroShear readout when paired with `--tactile_backend surface_hydro`.
 - `--compare_hydro_normal`: add a separate HydroShear comparison panel.
 - `--hydro_normal_scale`: scale the HydroShear normal channel in comparison mode.
 - `--hydro_shear_scale`: scale the HydroShear shear channels in comparison mode.

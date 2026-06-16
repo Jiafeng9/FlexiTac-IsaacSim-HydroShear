@@ -13,9 +13,12 @@ from tactile.contact import SurfacePointContactState  # noqa: E402
 from tactile.backend import HydroShearTactileBackend, HydroShearTactileBackendCfg  # noqa: E402
 from tactile.elastomer import MeshPatchElastomerSdf  # noqa: E402
 from tactile.hydroshear import (  # noqa: E402
+    BumpHydroShearCfg,
+    BumpHydroShearTracker,
     SurfacePointHydroShearCfg,
     SurfacePointHydroShearTracker,
     contact_segment_fraction,
+    create_bump_grid_centers,
 )
 from tactile.readout import (  # noqa: E402
     HydroShearMarkerProjector,
@@ -255,6 +258,265 @@ def test_hydroshear_displacement_stabilizers():
     clamped_tracker.update(samples, make_contact([[0.0, 0.0, -0.001]], [[0.0, 0.0, -1.0]], [-0.001]))
     out = clamped_tracker.update(samples, make_contact([[0.0, 0.0, -0.101]], [[0.0, 0.0, -1.0]], [-0.101]))
     assert_close(out.normal_force, torch.tensor([2.0]), atol=1.0e-5)
+
+
+def test_hydroshear_stationary_shear_does_not_decay():
+    samples = ObjectSurfaceSamples(
+        points_o=torch.zeros((1, 3), dtype=torch.float32),
+        normals_o=torch.tensor([[0.0, 0.0, -1.0]], dtype=torch.float32),
+        area=torch.tensor([1.0], dtype=torch.float32),
+    )
+    tracker = SurfacePointHydroShearTracker(
+        SurfacePointHydroShearCfg(
+            normal_stiffness=1.0,
+            shear_stiffness=1000.0,
+            friction_coefficient=10_000.0,
+            shear_decay=0.1,
+            normal_axis=2,
+        )
+    )
+
+    tracker.update(samples, make_contact([[0.0, 0.0, 0.001]], [[0.0, 0.0, -1.0]], [0.001]))
+    tracker.update(samples, make_contact([[0.0, 0.0, -0.001]], [[0.0, 0.0, -1.0]], [-0.001]))
+    moving = tracker.update(samples, make_contact([[0.001, 0.0, -0.001]], [[0.0, 0.0, -1.0]], [-0.001]))
+    stationary = tracker.update(samples, make_contact([[0.001, 0.0, -0.001]], [[0.0, 0.0, -1.0]], [-0.001]))
+
+    assert moving.shear_force_e[0, 0].item() < 0.0
+    assert_close(stationary.shear_force_e, moving.shear_force_e, atol=1.0e-6)
+
+
+def test_bump_hydroshear_normal_uses_current_penetration():
+    samples = ObjectSurfaceSamples(
+        points_o=torch.zeros((1, 3), dtype=torch.float32),
+        normals_o=torch.tensor([[0.0, 0.0, -1.0]], dtype=torch.float32),
+        area=torch.tensor([1.0], dtype=torch.float32),
+    )
+    tracker = BumpHydroShearTracker(
+        BumpHydroShearCfg(
+            enabled=True,
+            num_rows=1,
+            num_cols=1,
+            normal_stiffness=1000.0,
+            shear_stiffness=100.0,
+            shear_decay=0.25,
+            normal_axis=2,
+        )
+    )
+    centers = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
+    contact = make_contact([[0.0, 0.0, -0.001]], [[0.0, 0.0, -1.0]], [-0.001])
+
+    out = tracker.update(samples, contact, centers_p=centers)
+    assert_close(out.normal_force, torch.tensor([1.0]), atol=1.0e-6)
+
+    out = tracker.update(samples, contact, centers_p=centers)
+    assert_close(out.normal_force, torch.tensor([1.0]), atol=1.0e-6)
+
+
+def test_bump_hydroshear_slide_saturates_with_expected_sign():
+    samples = ObjectSurfaceSamples(
+        points_o=torch.zeros((1, 3), dtype=torch.float32),
+        normals_o=torch.tensor([[0.0, 0.0, -1.0]], dtype=torch.float32),
+        area=torch.tensor([1.0], dtype=torch.float32),
+    )
+    tracker = BumpHydroShearTracker(
+        BumpHydroShearCfg(
+            enabled=True,
+            num_rows=1,
+            num_cols=1,
+            normal_stiffness=1000.0,
+            shear_stiffness=1000.0,
+            friction_coefficient=0.5,
+            normal_axis=2,
+        )
+    )
+    centers = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
+
+    tracker.update(samples, make_contact([[0.0, 0.0, -0.001]], [[0.0, 0.0, -1.0]], [-0.001]), centers_p=centers)
+    out = tracker.update(samples, make_contact([[0.002, 0.0, -0.001]], [[0.0, 0.0, -1.0]], [-0.001]), centers_p=centers)
+
+    assert_close(out.normal_force, torch.tensor([1.0]), atol=1.0e-6)
+    assert out.shear_force_e[0, 0].item() < 0.0
+    assert_close(out.shear_force_e[0], torch.tensor([-0.5, 0.0, 0.0]), atol=1.0e-5)
+    assert_close(out.shear_force_e.norm(dim=-1), torch.tensor([0.5]), atol=1.0e-5)
+
+
+def test_bump_hydroshear_stationary_shear_does_not_decay():
+    samples = ObjectSurfaceSamples(
+        points_o=torch.zeros((1, 3), dtype=torch.float32),
+        normals_o=torch.tensor([[0.0, 0.0, -1.0]], dtype=torch.float32),
+        area=torch.tensor([1.0], dtype=torch.float32),
+    )
+    tracker = BumpHydroShearTracker(
+        BumpHydroShearCfg(
+            enabled=True,
+            num_rows=1,
+            num_cols=1,
+            normal_stiffness=1000.0,
+            shear_stiffness=1000.0,
+            friction_coefficient=10.0,
+            shear_decay=0.1,
+            normal_axis=2,
+        )
+    )
+    centers = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
+
+    tracker.update(samples, make_contact([[0.0, 0.0, -0.001]], [[0.0, 0.0, -1.0]], [-0.001]), centers_p=centers)
+    moving = tracker.update(samples, make_contact([[0.001, 0.0, -0.001]], [[0.0, 0.0, -1.0]], [-0.001]), centers_p=centers)
+    stationary = tracker.update(
+        samples,
+        make_contact([[0.001, 0.0, -0.001]], [[0.0, 0.0, -1.0]], [-0.001]),
+        centers_p=centers,
+    )
+
+    assert moving.shear_force_e[0, 0].item() < 0.0
+    assert_close(stationary.shear_force_e, moving.shear_force_e, atol=1.0e-6)
+
+
+def test_bump_hydroshear_pure_tangent_shear_axes():
+    for normal_axis in (0, 1, 2):
+        tangent_axes = [0, 1, 2]
+        tangent_axes.remove(normal_axis)
+        normal = torch.zeros(3, dtype=torch.float32)
+        normal[normal_axis] = -1.0
+
+        for move_axis in tangent_axes:
+            samples = ObjectSurfaceSamples(
+                points_o=torch.zeros((1, 3), dtype=torch.float32),
+                normals_o=normal.view(1, 3),
+                area=torch.tensor([1.0], dtype=torch.float32),
+            )
+            tracker = BumpHydroShearTracker(
+                BumpHydroShearCfg(
+                    enabled=True,
+                    num_rows=1,
+                    num_cols=1,
+                    normal_stiffness=1000.0,
+                    shear_stiffness=1000.0,
+                    friction_coefficient=100.0,
+                    normal_axis=normal_axis,
+                )
+            )
+            centers = torch.zeros((1, 3), dtype=torch.float32)
+            prev = torch.zeros(3, dtype=torch.float32)
+            prev[normal_axis] = -0.001
+            curr = prev.clone()
+            curr[move_axis] = 0.001
+
+            tracker.update(samples, make_contact([prev.tolist()], [normal.tolist()], [-0.001]), centers_p=centers)
+            out = tracker.update(samples, make_contact([curr.tolist()], [normal.tolist()], [-0.001]), centers_p=centers)
+
+            expected = torch.zeros(3, dtype=torch.float32)
+            expected[move_axis] = -1.0
+            assert_close(out.normal_force, torch.tensor([1.0]), atol=1.0e-6)
+            assert_close(out.shear_force_e[0], expected, atol=1.0e-6)
+            assert_close(out.shear_force_e[0, normal_axis], torch.tensor(0.0), atol=1.0e-6)
+
+
+def test_bump_hydroshear_shear_is_bump_local():
+    samples = ObjectSurfaceSamples(
+        points_o=torch.zeros((1, 3), dtype=torch.float32),
+        normals_o=torch.tensor([[0.0, 0.0, -1.0]], dtype=torch.float32),
+        area=torch.tensor([1.0], dtype=torch.float32),
+    )
+    tracker = BumpHydroShearTracker(
+        BumpHydroShearCfg(
+            enabled=True,
+            num_rows=1,
+            num_cols=2,
+            normal_stiffness=1000.0,
+            shear_stiffness=1000.0,
+            friction_coefficient=0.5,
+            normal_axis=2,
+        )
+    )
+    centers = torch.tensor([[-1.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=torch.float32)
+
+    tracker.update(samples, make_contact([[-1.0, 0.0, -0.001]], [[0.0, 0.0, -1.0]], [-0.001]), centers_p=centers)
+    out = tracker.update(samples, make_contact([[-0.5, 0.0, -0.001]], [[0.0, 0.0, -1.0]], [-0.001]), centers_p=centers)
+    assert out.shear_force_e[0].norm().item() > 0.0
+    assert_close(out.shear_force_e[1], torch.zeros(3), atol=1.0e-6)
+
+    out = tracker.update(samples, make_contact([[1.0, 0.0, -0.001]], [[0.0, 0.0, -1.0]], [-0.001]), centers_p=centers)
+    assert_close(out.shear_force_e[0], torch.zeros(3), atol=1.0e-6)
+    assert_close(out.shear_force_e[1], torch.zeros(3), atol=1.0e-6)
+    assert_close(out.normal_force, torch.tensor([0.0, 1.0]), atol=1.0e-6)
+
+
+def test_bump_hydroshear_is_sample_count_invariant():
+    def run(num_points: int):
+        samples = ObjectSurfaceSamples(
+            points_o=torch.zeros((num_points, 3), dtype=torch.float32),
+            normals_o=torch.tensor([[0.0, 0.0, -1.0]], dtype=torch.float32).repeat(num_points, 1),
+            area=torch.ones(num_points, dtype=torch.float32),
+        )
+        tracker = BumpHydroShearTracker(
+            BumpHydroShearCfg(
+                enabled=True,
+                num_rows=1,
+                num_cols=1,
+                normal_stiffness=1000.0,
+                shear_stiffness=1000.0,
+                friction_coefficient=10.0,
+                normal_axis=2,
+            )
+        )
+        centers = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32)
+        tracker.update(
+            samples,
+            make_contact([[0.0, 0.0, -0.001]] * num_points, [[0.0, 0.0, -1.0]] * num_points, [-0.001] * num_points),
+            centers_p=centers,
+        )
+        return tracker.update(
+            samples,
+            make_contact([[0.001, 0.0, -0.001]] * num_points, [[0.0, 0.0, -1.0]] * num_points, [-0.001] * num_points),
+            centers_p=centers,
+        )
+
+    one = run(1)
+    many = run(10)
+    assert_close(many.normal_force, one.normal_force, atol=1.0e-6)
+    assert_close(many.shear_force_e, one.shear_force_e, atol=1.0e-6)
+
+
+def test_bump_centers_use_mesh_sensing_surface():
+    actual_u = torch.tensor([-1.0, 1.0], dtype=torch.float32)
+    actual_v = torch.tensor([-2.0, 0.0, 2.0], dtype=torch.float32)
+    top_vertices = []
+    for u in actual_u.tolist():
+        for v in actual_v.tolist():
+            top_vertices.extend(
+                [
+                    [u - 0.1, v, -0.2],
+                    [u + 0.1, v, -0.2],
+                    [u, v - 0.1, -0.2],
+                    [u, v + 0.1, -0.2],
+                ]
+            )
+    base_vertices = [
+        [-10.0, -10.0, 1.0],
+        [10.0, -10.0, 1.0],
+        [10.0, 10.0, 1.0],
+        [-10.0, 10.0, 1.0],
+    ]
+    vertices = torch.tensor(top_vertices + base_vertices, dtype=torch.float32)
+
+    centers = create_bump_grid_centers(
+        BumpHydroShearCfg(
+            enabled=True,
+            num_rows=2,
+            num_cols=3,
+            normal_axis=2,
+            normal_direction=-1.0,
+        ),
+        TaxelGridCfg(num_rows=2, num_cols=3, normal_axis=2),
+        vertices,
+    )
+    uu, vv = torch.meshgrid(actual_u, actual_v, indexing="ij")
+    expected = torch.stack(
+        (uu.reshape(-1), vv.reshape(-1), torch.full((6,), -0.2, dtype=torch.float32)),
+        dim=-1,
+    )
+    assert_close(centers, expected, atol=1.0e-5)
 
 
 def test_taxel_grid_points_match_warp_sdf_layout():
@@ -509,6 +771,39 @@ def test_hydroshear_backend_marker_field_output_mode():
     out = backend.update(samples, object_pos_e=torch.tensor([0.0, 0.0, -0.001]), object_quat_e=quat_identity)
     assert out.observations["tactile"].shape == (1, 1, 3)
     assert_close(out.observations["tactile"], out.observations["tactile_marker"], atol=1.0e-6)
+
+
+def test_hydroshear_bump_marker_field_outputs_force_not_marker_displacement():
+    samples = ObjectSurfaceSamples(
+        points_o=torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32),
+        normals_o=torch.tensor([[0.0, 0.0, -1.0]], dtype=torch.float32),
+        area=torch.tensor([1.0], dtype=torch.float32),
+    )
+    backend = HydroShearTactileBackend(
+        HydroShearTactileBackendCfg(
+            grid=TaxelGridCfg(num_rows=1, num_cols=1, point_distance=0.01, normal_axis=2),
+            **slab_elastomer_kwargs(2),
+            bump=BumpHydroShearCfg(
+                enabled=True,
+                num_rows=1,
+                num_cols=1,
+                centers_p=torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float32),
+                normal_stiffness=1000.0,
+                normal_axis=2,
+            ),
+            output_mode="marker_field",
+            output_key="tactile",
+        )
+    )
+    quat_identity = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=torch.float32)
+    backend.update(samples, object_pos_e=torch.tensor([0.0, 0.0, 0.001]), object_quat_e=quat_identity)
+    out = backend.update(samples, object_pos_e=torch.tensor([0.0, 0.0, -0.001]), object_quat_e=quat_identity)
+
+    assert out.bump_surface is not None
+    assert out.observations["tactile"].shape == (1, 1, 3)
+    assert_close(out.observations["tactile"], out.observations["tactile_force"], atol=1.0e-6)
+    assert_close(out.observations["tactile_marker"], torch.zeros((1, 1, 3)), atol=1.0e-6)
+    assert out.observations["tactile"][0, 0, 0].item() > 0.0
 
 
 def test_axis_aligned_motion_only_produces_matching_marker_shear_axis():
@@ -775,6 +1070,89 @@ def test_aloha_hydroshear_core_cfg_uses_slot_signs_and_marker_scale():
     assert core.cfg.projection.lambda_s == 300.0
 
 
+def test_aloha_hydroshear_normal_direction_follows_surface_direction():
+    def make_cfg(backend_cfg):
+        cfg = _Obj()
+        cfg.robot = _Obj()
+        cfg.tactile = _Obj()
+        cfg.tactile.num_rows = 2
+        cfg.tactile.num_cols = 3
+        cfg.tactile.point_distance = 0.01
+        cfg.tactile.normal_axis = 2
+        cfg.tactile.normal_offset = 0.0
+        cfg.tactile.output_key = "tactile"
+        cfg.tactile.backend = backend_cfg
+        return cfg
+
+    vertices, faces = slab_mesh(2)
+    default_backend = AlohaHydroShearTactileBackend(
+        make_cfg(AlohaHydroShearTactileBackendCfg(bump_enabled=True, bump_rows=1, bump_cols=1, bump_center_source="mesh_surface")),
+        patch_transform=None,
+        robot_asset=None,
+        device="cpu",
+    )
+    default_core = default_backend._make_core_backend(slot=0, elastomer_vertices_p=vertices, elastomer_faces=faces)
+    assert default_core.cfg.hydroshear.normal_direction == -1.0
+    assert default_core.cfg.bump.normal_direction == -1.0
+
+    override_backend = AlohaHydroShearTactileBackend(
+        make_cfg(
+            AlohaHydroShearTactileBackendCfg(
+                bump_enabled=True,
+                bump_rows=1,
+                bump_cols=1,
+                bump_center_source="mesh_surface",
+                taxel_surface_local_z_dir=-1.0,
+                normal_direction=1.0,
+            )
+        ),
+        patch_transform=None,
+        robot_asset=None,
+        device="cpu",
+    )
+    override_core = override_backend._make_core_backend(slot=0, elastomer_vertices_p=vertices, elastomer_faces=faces)
+    assert override_core.cfg.hydroshear.normal_direction == 1.0
+    assert override_core.cfg.bump.normal_direction == 1.0
+
+
+def test_aloha_hydroshear_hardcoded_bump_centers_match_imported_layout():
+    tactile_cfg = _Obj()
+    tactile_cfg.normal_axis = 0
+    backend_cfg = AlohaHydroShearTactileBackendCfg(bump_enabled=True, bump_rows=4, bump_cols=8)
+    vertices = torch.tensor(
+        [
+            [-0.0015, -0.013, -0.033325],
+            [-0.0015, 0.013, -0.033325],
+            [-0.0015, 0.013, 0.033325],
+            [-0.0015, -0.013, 0.033325],
+            [0.0015, -0.013, -0.033325],
+            [0.0015, 0.013, -0.033325],
+            [0.0015, 0.013, 0.033325],
+            [0.0015, -0.013, 0.033325],
+        ],
+        dtype=torch.float32,
+    )
+
+    centers = AlohaHydroShearTactileBackend._bump_centers_p_for_backend(
+        backend_cfg,
+        tactile_cfg,
+        vertices,
+        normal_direction=-1.0,
+    )
+    assert centers is not None
+    expected_y = torch.tensor([-0.00771186, 0.0, 0.00771186], dtype=torch.float32)
+    expected_z = torch.tensor(
+        [-0.027125, -0.01808333, -0.00904167, 0.0, 0.00904167, 0.01808333, 0.027125],
+        dtype=torch.float32,
+    )
+    yy, zz = torch.meshgrid(expected_y, expected_z, indexing="ij")
+    expected = torch.stack(
+        (torch.full((21,), -0.0015, dtype=torch.float32), yy.reshape(-1), zz.reshape(-1)),
+        dim=-1,
+    )
+    assert_close(centers, expected, atol=1.0e-6)
+
+
 def test_aloha_hydroshear_defaults_match_official_marker_lambdas_and_signs():
     cfg = AlohaHydroShearTactileBackendCfg()
     assert cfg.marker_lambda_s == 300.0
@@ -794,6 +1172,14 @@ def main():
     test_hydroshear_update_and_reset()
     test_hydroshear_unit_area_displacement_state()
     test_hydroshear_displacement_stabilizers()
+    test_hydroshear_stationary_shear_does_not_decay()
+    test_bump_hydroshear_normal_uses_current_penetration()
+    test_bump_hydroshear_slide_saturates_with_expected_sign()
+    test_bump_hydroshear_stationary_shear_does_not_decay()
+    test_bump_hydroshear_pure_tangent_shear_axes()
+    test_bump_hydroshear_shear_is_bump_local()
+    test_bump_hydroshear_is_sample_count_invariant()
+    test_bump_centers_use_mesh_sensing_surface()
     test_taxel_grid_points_match_warp_sdf_layout()
     test_surface_force_projection_to_taxel_grid()
     test_projection_separates_normal_and_shear_penetration_weights()
@@ -804,6 +1190,7 @@ def main():
     test_projected_surface_point_tracker()
     test_hydroshear_backend_update_observations()
     test_hydroshear_backend_marker_field_output_mode()
+    test_hydroshear_bump_marker_field_outputs_force_not_marker_displacement()
     test_axis_aligned_motion_only_produces_matching_marker_shear_axis()
     test_force_and_marker_shear_axes_for_all_normal_axes()
     test_hydroshear_backend_queries_object_sdf_for_marker_dilation()
@@ -811,6 +1198,8 @@ def main():
     test_hydroshear_backend_projected_surface_state_and_reset()
     test_aloha_hydroshear_multi_sensor_observations_and_reset()
     test_aloha_hydroshear_core_cfg_uses_slot_signs_and_marker_scale()
+    test_aloha_hydroshear_normal_direction_follows_surface_direction()
+    test_aloha_hydroshear_hardcoded_bump_centers_match_imported_layout()
     test_aloha_hydroshear_defaults_match_official_marker_lambdas_and_signs()
     print("[OK] HydroShear core checks passed")
 

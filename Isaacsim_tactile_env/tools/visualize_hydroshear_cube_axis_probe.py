@@ -19,7 +19,11 @@ os.environ.setdefault("MPLCONFIGDIR", str(ROOT / "output" / ".matplotlib"))
 
 from tactile.readout import tangential_axes  # noqa: E402
 from tactile.surface import ObjectSurfaceSampler, ObjectSurfaceSamplerCfg  # noqa: E402
-from visualize_hydroshear_axis_probe import make_backend  # noqa: E402
+from visualize_hydroshear_axis_probe import (  # noqa: E402
+    bump_frame_fields_from_output,
+    contact_shear_vectors_from_output,
+    make_backend,
+)
 
 
 def parse_args():
@@ -41,6 +45,13 @@ def parse_args():
     parser.add_argument("--gif_stride", type=int, default=2)
     parser.add_argument("--lambda_s", type=float, default=10_800.0)
     parser.add_argument("--mu", type=float, default=10.0)
+    parser.add_argument(
+        "--use_bump",
+        "--use-bump",
+        action="store_true",
+        dest="use_bump",
+        help="Use the per-bump HydroShear state/readout.",
+    )
     parser.add_argument(
         "--output_dir",
         type=str,
@@ -141,7 +152,7 @@ def _collect_frame(args, backend, samples, vertices, faces, pos, prev_pos, step:
         dtype=np.float64,
     )
     pos_np = pos.detach().cpu().numpy()
-    return {
+    frame = {
         "step": step,
         "phase": phase,
         "channel": int(channel),
@@ -157,8 +168,10 @@ def _collect_frame(args, backend, samples, vertices, faces, pos, prev_pos, step:
         "contact_points": out.contact.points_p.detach().cpu().numpy(),
         "contact_mask": out.contact.contact_mask.detach().cpu().numpy(),
         "penetration": out.contact.penetration.detach().cpu().numpy(),
-        "surface_shear_e": out.surface.shear_force_e.detach().cpu().numpy(),
+        "surface_shear_e": contact_shear_vectors_from_output(out),
     }
+    frame.update(bump_frame_fields_from_output(out))
+    return frame
 
 
 def run_dynamic_case(args, channel: int) -> dict:

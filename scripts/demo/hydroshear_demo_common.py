@@ -44,6 +44,7 @@ def make_probe_args(**overrides):
         gif_stride=2,
         lambda_s=10_800.0,
         mu=10.0,
+        use_bump=False,
         output_dir=str(TACTILE_ROOT / "output" / "hydroshear_demo"),
         basename="hydroshear_demo",
         num_points=2048,
@@ -59,7 +60,9 @@ def build_case(*, complex_geometry: bool, channel: int, **overrides) -> dict:
     args = make_probe_args(**overrides)
     print(
         f"[HydroShear demo] building pytorch_volumetric SDF case "
-        f"({'complex cube' if complex_geometry else 'flat slab'}, channel={int(channel)})...",
+        f"({'complex cube' if complex_geometry else 'flat slab'}, "
+        f"model={'bump' if bool(getattr(args, 'use_bump', False)) else 'surface'}, "
+        f"channel={int(channel)})...",
         flush=True,
     )
     if complex_geometry:

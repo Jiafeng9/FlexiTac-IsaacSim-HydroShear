@@ -73,7 +73,17 @@ def resolve_mesh_prim(root_path, *, prim_utils, sim_utils):
             traverse_instance_prims=True,
         )
         if children:
-            query_path = children[0].GetPath().pathString
+            def rank_mesh(prim):
+                path = prim.GetPath().pathString.lower()
+                if "/collisions/" in path or path.endswith("/collisions"):
+                    return 0
+                if "collision" in path:
+                    return 1
+                if "/visuals/" in path or path.endswith("/visuals"):
+                    return 3
+                return 2
+
+            query_path = min(children, key=rank_mesh).GetPath().pathString
 
     query_prim = prim_utils.get_prim_at_path(query_path)
     if not query_prim or not query_prim.IsValid():

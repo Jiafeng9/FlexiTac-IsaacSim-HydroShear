@@ -36,12 +36,17 @@ from .geometry import (
     transform_points,
 )
 from .hydroshear import (
+    BumpHydroShearCfg,
+    BumpHydroShearOutput,
+    BumpHydroShearState,
+    BumpHydroShearTracker,
     HydroShearTactileBackend,
     HydroShearTactileBackendCfg,
     HydroShearTactileBackendOutput,
     SurfacePointHydroShearCfg,
     SurfacePointHydroShearOutput,
     SurfacePointHydroShearTracker,
+    create_bump_grid_centers,
     contact_segment_fraction,
 )
 from .readout import (
@@ -81,6 +86,10 @@ for _name, _module in _LEGACY_SUBMODULES.items():
 
 __all__ = [
     "ElastomerSdfResult",
+    "BumpHydroShearCfg",
+    "BumpHydroShearOutput",
+    "BumpHydroShearState",
+    "BumpHydroShearTracker",
     "HydroShearMarkerProjector",
     "HydroShearMarkerReadout",
     "HydroShearMarkerReadoutCfg",
@@ -112,6 +121,7 @@ __all__ = [
     "TaxelShearTrackerCfg",
     "compute_per_taxel_delta_tangent",
     "contact_segment_fraction",
+    "create_bump_grid_centers",
     "create_taxel_grid_points",
     "first_visual_mesh_from_urdf",
     "inverse_transform_points",
