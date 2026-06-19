@@ -2,23 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .backend import HydroShearTactileBackendCfg, TaxelShearTactileBackendCfg, WarpSdfTactileBackendCfg
-
-
-def _hydro_observation_backend_cfg() -> HydroShearTactileBackendCfg:
-    return HydroShearTactileBackendCfg(include_force_observations=True)
+from .backend import HydroShearTactileBackendCfg
 
 
 @dataclass
 class AlohaTactileCfg:
     """ALOHA tactile binding, shared taxel geometry, and selected backend config."""
 
-    backend: WarpSdfTactileBackendCfg | TaxelShearTactileBackendCfg | HydroShearTactileBackendCfg = field(
-        default_factory=WarpSdfTactileBackendCfg
-    )
-    enable_hydro_normal_observation: bool = False
-    hydro_normal_output_key: str = "tactile_hydro"
-    hydro_normal_backend: HydroShearTactileBackendCfg = field(default_factory=_hydro_observation_backend_cfg)
+    backend: HydroShearTactileBackendCfg = field(default_factory=HydroShearTactileBackendCfg)
 
     # ALOHA binding
     link_name_contains: str = "elastomer"

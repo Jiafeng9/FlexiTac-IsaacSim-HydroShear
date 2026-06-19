@@ -1,7 +1,8 @@
-"""Standalone gymnasium.Env for ALOHA bimanual robot with WarpSdf tactile sensors."""
+"""Standalone gymnasium.Env for ALOHA bimanual robot with HydroShear tactile readout."""
 
 from __future__ import annotations
 
+import builtins
 import os
 from pathlib import Path
 
@@ -41,6 +42,8 @@ class AlohaTactileEnv(gymnasium.Env):
         self._simulation_app = simulation_app
         self._step_count = 0
         self._base_dir = str(Path(__file__).resolve().parent.parent)
+        if not hasattr(builtins, "ISAACLAB_CALLBACK_EXCEPTION"):
+            builtins.ISAACLAB_CALLBACK_EXCEPTION = None
 
         import isaacsim.core.utils.prims as prim_utils
         from isaacsim.core.api.simulation_context import SimulationContext
@@ -52,7 +55,6 @@ class AlohaTactileEnv(gymnasium.Env):
         from isaaclab.assets import Articulation, RigidObject
         from isaaclab.assets.articulation import ArticulationCfg
         from isaaclab.assets.rigid_object import RigidObjectCfg
-        from isaaclab.sensors.warp_sdf_tactile import WarpSdfTactileSensor, WarpSdfTactileSensorCfg
         from isaaclab.sim.converters import UrdfConverterCfg
         from isaaclab.sim.schemas import activate_contact_sensors
 
@@ -94,7 +96,7 @@ class AlohaTactileEnv(gymnasium.Env):
         from pxr import PhysxSchema, UsdPhysics
 
         self._UsdPhysics = UsdPhysics
-        self._tactile_setup = AlohaTactileSetup(
+        self._tactile_setup = AlohaTactileSetup(    # tactile info
             cfg,
             sim_utils,
             prim_utils,
@@ -104,8 +106,6 @@ class AlohaTactileEnv(gymnasium.Env):
             self._urdf_origins,
             UsdPhysics,
             PhysxSchema,
-            WarpSdfTactileSensor,
-            WarpSdfTactileSensorCfg,
             self._device,
         )
         self._selected_links = self._tactile_setup.selected_links

@@ -1,14 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import csv
-import json
 import os
 import site
 import sys
 import threading
 import xml.etree.ElementTree as ET
-from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -19,19 +16,7 @@ from isaaclab.app import AppLauncher
 
 parser = argparse.ArgumentParser(description="ALOHA bimanual drag control and visualization")
 parser.add_argument("--port", type=int, default=8080, help="Viser server port")
-parser.add_argument("--save_dir", type=str, default="", help="Directory for saved trajectory .npz files")
 parser.add_argument("--slow_interval", type=int, default=8, help="UI refresh interval for expensive updates")
-parser.add_argument(
-    "--compare_hydro_normal",
-    action="store_true",
-    help="Show original WarpSDF normal, HydroShear normal, and HydroShear shear x/y.",
-)
-parser.add_argument(
-    "--tactile_backend",
-    choices=("normal", "taxel_shear", "surface_hydro"),
-    default="normal",
-    help="Main tactile backend: original normal, taxel-level shear, or surface-point HydroShear.",
-)
 parser.add_argument(
     "--shear_vis_vmax",
     type=float,
@@ -75,42 +60,6 @@ parser.add_argument(
     help="Additional world +Z lift for the 3D shear arrow field in meters.",
 )
 parser.add_argument(
-    "--shear_csv_dir",
-    type=str,
-    default="",
-    help="Directory for Start Shear CSV recordings. Default: output/tactile_shear_csv.",
-)
-parser.add_argument(
-    "--shear_csv_interval",
-    type=int,
-    default=1,
-    help="Record tactile_shear CSV every N simulation steps.",
-)
-parser.add_argument(
-    "--hydro_normal_scale",
-    type=float,
-    default=1.0,
-    help="Readout scale applied to HydroShear normal values in --compare_hydro_normal mode.",
-)
-parser.add_argument(
-    "--hydro_shear_scale",
-    type=float,
-    default=1.0,
-    help="Readout scale applied to HydroShear shear x/y values in --compare_hydro_normal mode.",
-)
-parser.add_argument(
-    "--hydro_shear_stiffness",
-    type=float,
-    default=None,
-    help="Optional HydroShear tangential stiffness override in --compare_hydro_normal mode.",
-)
-parser.add_argument(
-    "--object_shape",
-    choices=("plug_socket", "cube"),
-    default="plug_socket",
-    help="Spawn the default plug/socket URDF objects or simple cube objects for tactile tests.",
-)
-parser.add_argument(
     "--use_bump_pad",
     action="store_true",
     help="Use the generated bump-pad ALOHA URDF instead of the flat-pad tactile URDF.",
@@ -122,17 +71,6 @@ parser.add_argument(
     help="Optional robot URDF override. Takes precedence over --use_bump_pad.",
 )
 parser.add_argument(
-    "--cube_side",
-    type=float,
-    default=0.026,
-    help="Cube side length in meters when --object_shape cube is used.",
-)
-parser.add_argument(
-    "--cube_fix_base",
-    action="store_true",
-    help="Keep cube objects fixed in place when --object_shape cube is used.",
-)
-parser.add_argument(
     "--save_camera_renders",
     action="store_true",
     help="Save camera RGB frames from the simulation loop.",
@@ -142,12 +80,6 @@ parser.add_argument(
     type=str,
     default="",
     help="Directory for saved camera frames. Default: output/renders.",
-)
-parser.add_argument(
-    "--hydro_sample_debug_dir",
-    type=str,
-    default="",
-    help="Directory for Save Hydro Samples dumps. Default: output/hydroshear_sample_debug/live.",
 )
 parser.add_argument(
     "--max_steps",
@@ -190,7 +122,7 @@ from aloha.camera import AlohaCameraCfg
 from aloha.cfg import AlohaTactileEnvCfg, DATASET_JOINT_ORDER
 from aloha.env import AlohaTactileEnv
 from aloha.scene import AlohaSimCfg
-from aloha.tactile import HydroShearTactileBackendCfg, TaxelShearTactileBackendCfg
+from aloha.tactile import HydroShearTactileBackendCfg
 
 
 # ---------------------------------------------------------------------------
@@ -252,15 +184,6 @@ def tactile_shear_uv(grid: np.ndarray | None) -> np.ndarray | None:
     if grid.ndim >= 3 and grid.shape[-1] == 3:
         return grid[..., 1:3]
     return grid
-
-
-def tactile_marker_vector_uv(grid: np.ndarray | None) -> np.ndarray | None:
-    if grid is None:
-        return None
-    grid = np.asarray(grid)
-    if grid.ndim >= 3 and grid.shape[-1] == 3:
-        return grid[..., 1:3]
-    return None
 
 
 def signed_tactile_to_rgb(grid: np.ndarray, scale: int = 8, vmax: float | None = None) -> np.ndarray:
@@ -332,6 +255,9 @@ def _shear_vis_vmax(*grids: np.ndarray) -> float:
 
 
 def _tangential_axes(normal_axis: int) -> tuple[int, int]:
+    '''
+        Based on the normal axis, get the other two tangential axis
+    '''
     axes = [0, 1, 2]
     axes.remove(int(normal_axis))
     return axes[0], axes[1]
@@ -447,208 +373,6 @@ def _quat_mul_wxyz(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     ], dtype=np.float64)
 
 
-def _to_numpy(x) -> np.ndarray:
-    if x is None:
-        return np.empty((0,), dtype=np.float32)
-    if hasattr(x, "detach"):
-        x = x.detach().cpu().numpy()
-    return np.asarray(x)
-
-
-def _set_equal_2d(ax, x: np.ndarray, y: np.ndarray, *, margin: float = 0.05) -> None:
-    if x.size == 0 or y.size == 0:
-        return
-    xmin, xmax = float(np.nanmin(x)), float(np.nanmax(x))
-    ymin, ymax = float(np.nanmin(y)), float(np.nanmax(y))
-    span = max(xmax - xmin, ymax - ymin, 1.0e-6)
-    cx = 0.5 * (xmin + xmax)
-    cy = 0.5 * (ymin + ymax)
-    half = 0.5 * span * (1.0 + margin)
-    ax.set_xlim(cx - half, cx + half)
-    ax.set_ylim(cy - half, cy + half)
-    ax.set_aspect("equal", adjustable="box")
-
-
-def _plot_hydro_projection(
-    ax,
-    *,
-    pad: np.ndarray,
-    points: np.ndarray,
-    centers: np.ndarray,
-    sdf: np.ndarray,
-    axes: tuple[int, int],
-    labels: tuple[str, str],
-    title: str,
-    zoom_to_pad: bool = False,
-) -> None:
-    ai, aj = axes
-    if pad.size:
-        ax.scatter(pad[:, ai], pad[:, aj], s=1, c="0.75", alpha=0.25, label="pad mesh")
-    if centers.size:
-        ax.scatter(centers[:, ai], centers[:, aj], s=18, c="black", marker="x", linewidths=0.8, label="bump centers")
-    if points.size and sdf.size == points.shape[0]:
-        contact = sdf < 0.0
-        outside = ~contact
-        if outside.any():
-            positive_sdf = np.maximum(sdf[outside], 0.0)
-            vmax = float(np.nanpercentile(positive_sdf, 95)) + 1.0e-9
-            ax.scatter(
-                points[outside, ai],
-                points[outside, aj],
-                s=2,
-                c=np.clip(positive_sdf, 0.0, vmax),
-                cmap="viridis",
-                alpha=0.35,
-                label="object samples outside",
-            )
-        if contact.any():
-            ax.scatter(points[contact, ai], points[contact, aj], s=8, c="red", alpha=0.85, label="object samples contact")
-
-    ax.set_title(title)
-    ax.set_xlabel(labels[0])
-    ax.set_ylabel(labels[1])
-    ax.grid(True, linewidth=0.3, alpha=0.35)
-    if zoom_to_pad and pad.size:
-        xmin, xmax = float(pad[:, ai].min()), float(pad[:, ai].max())
-        ymin, ymax = float(pad[:, aj].min()), float(pad[:, aj].max())
-        pad_span = max(xmax - xmin, ymax - ymin, 1.0e-6)
-        pad_margin = max(0.008, pad_span * 0.35)
-        ax.set_xlim(xmin - pad_margin, xmax + pad_margin)
-        ax.set_ylim(ymin - pad_margin, ymax + pad_margin)
-        ax.set_aspect("equal", adjustable="box")
-    elif pad.size:
-        all_x = np.concatenate([pad[:, ai], points[:, ai]]) if points.size else pad[:, ai]
-        all_y = np.concatenate([pad[:, aj], points[:, aj]]) if points.size else pad[:, aj]
-        _set_equal_2d(ax, all_x, all_y)
-
-
-def _hydro_debug_summary(obs: dict) -> dict:
-    keys = [
-        "tactile_contact_count",
-        "tactile_bump_contact_count",
-        "tactile_max_penetration",
-        "tactile_min_sdf",
-    ]
-    summary = {}
-    for key in keys:
-        if key in obs:
-            summary[key] = np.asarray(obs[key]).reshape(-1).astype(float).tolist()
-    if "tactile" in obs:
-        tactile = np.asarray(obs["tactile"])
-        summary["tactile_max"] = [float(np.max(tactile[i])) for i in range(min(4, tactile.shape[0]))]
-    return summary
-
-
-def _save_hydro_sample_debug(env, obs: dict, output_root: str | Path) -> Path:
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    output_root = Path(output_root).expanduser()
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    output_dir = output_root / stamp
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    summary = _hydro_debug_summary(obs)
-    sensors = getattr(env, "_tactile_sensors", None)
-    if sensors is None:
-        setup = getattr(env, "_tactile_setup", None)
-        sensors = getattr(setup, "sensors", None) if setup is not None else None
-    sensors = list(sensors or [])
-    summary["num_sensors"] = len(sensors)
-    summary["sensors"] = []
-
-    for sensor_index, state in enumerate(sensors):
-        if getattr(state, "last_output", None) is None:
-            continue
-        contact = state.last_output.contact
-        points_p = _to_numpy(getattr(contact, "points_p", None))
-        sdf = _to_numpy(getattr(contact, "sdf", None)).reshape(-1)
-        pad = _to_numpy(getattr(state, "elastomer_vertices_p", None))
-        centers = np.empty((0, 3), dtype=np.float32)
-        core = getattr(state, "core", None)
-        if core is not None and getattr(core, "bump_centers_p", None) is not None:
-            centers = _to_numpy(core.bump_centers_p)
-
-        sensor_summary = {
-            "sensor_index": int(sensor_index),
-            "slot": int(getattr(state, "slot", sensor_index)),
-            "point_count": int(points_p.shape[0]) if points_p.ndim == 2 else 0,
-            "contact_count": int((sdf < 0.0).sum()) if sdf.size else 0,
-            "min_sdf": float(np.min(sdf)) if sdf.size else None,
-            "max_penetration": float(np.maximum(-sdf, 0.0).max()) if sdf.size else None,
-            "points_p_min": points_p.min(axis=0).astype(float).tolist() if points_p.ndim == 2 and points_p.size else None,
-            "points_p_max": points_p.max(axis=0).astype(float).tolist() if points_p.ndim == 2 and points_p.size else None,
-            "pad_p_min": pad.min(axis=0).astype(float).tolist() if pad.ndim == 2 and pad.size else None,
-            "pad_p_max": pad.max(axis=0).astype(float).tolist() if pad.ndim == 2 and pad.size else None,
-        }
-        summary["sensors"].append(sensor_summary)
-
-        if not (points_p.ndim == 2 and points_p.shape[-1] == 3 and pad.ndim == 2 and pad.shape[-1] == 3):
-            continue
-        fig, axs = plt.subplots(2, 2, figsize=(13.5, 10.5), constrained_layout=True)
-        fig.suptitle(
-            (
-                f"HydroShear samples sensor={sensor_index} slot={sensor_summary['slot']}\n"
-                f"contact={sensor_summary['contact_count']} min_sdf={sensor_summary['min_sdf']} "
-                f"max_pen={sensor_summary['max_penetration']}"
-            ),
-            fontsize=12,
-        )
-        _plot_hydro_projection(
-            axs[0, 0],
-            pad=pad,
-            points=points_p,
-            centers=centers,
-            sdf=sdf,
-            axes=(1, 2),
-            labels=("patch y", "patch z"),
-            title="Full tangent plane (y-z)",
-        )
-        _plot_hydro_projection(
-            axs[0, 1],
-            pad=pad,
-            points=points_p,
-            centers=centers,
-            sdf=sdf,
-            axes=(1, 2),
-            labels=("patch y", "patch z"),
-            title="Pad zoom tangent plane (y-z)",
-            zoom_to_pad=True,
-        )
-        _plot_hydro_projection(
-            axs[1, 0],
-            pad=pad,
-            points=points_p,
-            centers=centers,
-            sdf=sdf,
-            axes=(0, 1),
-            labels=("patch x normal", "patch y"),
-            title="Normal section (x-y)",
-        )
-        _plot_hydro_projection(
-            axs[1, 1],
-            pad=pad,
-            points=points_p,
-            centers=centers,
-            sdf=sdf,
-            axes=(0, 2),
-            labels=("patch x normal", "patch z"),
-            title="Normal section (x-z)",
-        )
-        handles, labels = axs[0, 0].get_legend_handles_labels()
-        if handles:
-            fig.legend(handles, labels, loc="lower center", ncol=4, fontsize=8)
-        fig.savefig(output_dir / f"sensor_{sensor_index}_slot_{sensor_summary['slot']}_samples.png", dpi=180)
-        plt.close(fig)
-
-    with (output_dir / "summary.json").open("w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
-    print(f"[hydro_debug] saved {output_dir}", flush=True)
-    return output_dir
-
-
 # ---------------------------------------------------------------------------
 # Thread-safe shared state
 # ---------------------------------------------------------------------------
@@ -671,10 +395,7 @@ class SharedState:
             },
         }
         self._reset_requested = False
-        self._recording = False
-        self._shear_csv_recording = False
         self._show_shear_arrows = True
-        self._hydro_sample_dump_requested = False
 
     def set_target(self, arm: str, x, y, z):
         with self._lock:
@@ -719,22 +440,6 @@ class SharedState:
         with self._lock:
             return bool(self._targets[arm]["dragging"])
 
-    def set_recording(self, v):
-        with self._lock:
-            self._recording = bool(v)
-
-    def is_recording(self):
-        with self._lock:
-            return self._recording
-
-    def set_shear_csv_recording(self, v):
-        with self._lock:
-            self._shear_csv_recording = bool(v)
-
-    def is_shear_csv_recording(self):
-        with self._lock:
-            return self._shear_csv_recording
-
     def set_show_shear_arrows(self, v):
         with self._lock:
             self._show_shear_arrows = bool(v)
@@ -742,17 +447,6 @@ class SharedState:
     def is_show_shear_arrows(self):
         with self._lock:
             return self._show_shear_arrows
-
-    def request_hydro_sample_dump(self):
-        with self._lock:
-            self._hydro_sample_dump_requested = True
-
-    def consume_hydro_sample_dump(self):
-        with self._lock:
-            if self._hydro_sample_dump_requested:
-                self._hydro_sample_dump_requested = False
-                return True
-            return False
 
 
 shared = SharedState()
@@ -774,312 +468,6 @@ def build_joint_name_map(urdf_joint_names):
                     break
         mapping.append(found)
     return mapping
-
-
-# ---------------------------------------------------------------------------
-# Trajectory recorder for current env outputs
-# ---------------------------------------------------------------------------
-
-class TrajectoryRecorder:
-    """Buffers per-step data and saves to .npz on flush."""
-
-    def __init__(self, save_dir: str):
-        self._save_dir = save_dir
-        os.makedirs(self._save_dir, exist_ok=True)
-        self._traj_count = len([f for f in os.listdir(self._save_dir) if f.endswith(".npz")])
-        self._buf: dict[str, list[np.ndarray]] = {}
-        self._steps = 0
-
-    def _append(self, key: str, arr: np.ndarray):
-        self._buf.setdefault(key, []).append(np.asarray(arr).copy())
-
-    def record(
-        self,
-        obs: dict,
-        left_target_pos: np.ndarray,
-        left_target_quat: np.ndarray,
-        left_gripper: float,
-        right_target_pos: np.ndarray,
-        right_target_quat: np.ndarray,
-        right_gripper: float,
-        left_ee_pos: np.ndarray | None = None,
-        left_ee_quat: np.ndarray | None = None,
-        right_ee_pos: np.ndarray | None = None,
-        right_ee_quat: np.ndarray | None = None,
-        joint_commands: np.ndarray | None = None,
-    ):
-        left_action = np.concatenate([
-            np.asarray(left_target_pos, dtype=np.float32).reshape(3),
-            np.asarray(left_target_quat, dtype=np.float32).reshape(4),
-            np.array([left_gripper], dtype=np.float32),
-        ])
-        right_action = np.concatenate([
-            np.asarray(right_target_pos, dtype=np.float32).reshape(3),
-            np.asarray(right_target_quat, dtype=np.float32).reshape(4),
-            np.array([right_gripper], dtype=np.float32),
-        ])
-        self._append("left_actions", left_action)
-        self._append("right_actions", right_action)
-        self._append("actions", np.concatenate([left_action, right_action], axis=0))
-        self._append("tactile", obs["tactile"])
-        if "tactile_force" in obs:
-            self._append("tactile_force", obs["tactile_force"])
-        if "tactile_shear" in obs:
-            self._append("tactile_shear", obs["tactile_shear"])
-        if "tactile_slip_ratio" in obs:
-            self._append("tactile_slip_ratio", obs["tactile_slip_ratio"])
-        if "tactile_shear_vector_w" in obs:
-            self._append("tactile_shear_vector_w", obs["tactile_shear_vector_w"])
-        if "tactile_hydro" in obs:
-            self._append("tactile_hydro", obs["tactile_hydro"])
-        if "tactile_hydro_force" in obs:
-            self._append("tactile_hydro_force", obs["tactile_hydro_force"])
-        if "tactile_hydro_shear" in obs:
-            self._append("tactile_hydro_shear", obs["tactile_hydro_shear"])
-        if "tactile_marker" in obs:
-            self._append("tactile_marker", obs["tactile_marker"])
-        if "tactile_marker_shear" in obs:
-            self._append("tactile_marker_shear", obs["tactile_marker_shear"])
-        if "tactile_hydro_marker" in obs:
-            self._append("tactile_hydro_marker", obs["tactile_hydro_marker"])
-        if "tactile_hydro_marker_shear" in obs:
-            self._append("tactile_hydro_marker_shear", obs["tactile_hydro_marker_shear"])
-        self._append("joint_pos", obs["joint_pos"])
-        self._append("joint_vel", obs["joint_vel"])
-        self._append("plug_pose", obs["plug_pose"])
-        self._append("socket_pose", obs["socket_pose"])
-
-        if "rgb" in obs:
-            self._append("rgb", obs["rgb"])
-
-        if left_ee_pos is not None and left_ee_quat is not None:
-            self._append("left_eef_pos_quat", np.concatenate([
-                np.asarray(left_ee_pos, dtype=np.float32).reshape(3),
-                np.asarray(left_ee_quat, dtype=np.float32).reshape(4),
-            ]))
-
-        if right_ee_pos is not None and right_ee_quat is not None:
-            self._append("right_eef_pos_quat", np.concatenate([
-                np.asarray(right_ee_pos, dtype=np.float32).reshape(3),
-                np.asarray(right_ee_quat, dtype=np.float32).reshape(4),
-            ]))
-
-        if joint_commands is not None:
-            self._append("joint_commands", np.asarray(joint_commands, dtype=np.float32))
-
-        self._steps += 1
-
-    @property
-    def num_steps(self) -> int:
-        return self._steps
-
-    def flush(self) -> str | None:
-        if self._steps == 0:
-            return None
-
-        data = {k: np.stack(v, axis=0) for k, v in self._buf.items()}
-        data["traj_lengths"] = np.array([self._steps], dtype=np.int32)
-
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"traj_{self._traj_count:04d}_{ts}.npz"
-        path = os.path.join(self._save_dir, fname)
-        np.savez_compressed(path, **data)
-
-        n = self._steps
-        self._buf.clear()
-        self._steps = 0
-        self._traj_count += 1
-        print(f"[SAVE] Trajectory saved: {path} ({n} steps, keys={sorted(data.keys())})", flush=True)
-        return path
-
-
-class TactileShearCsvRecorder:
-    """Streams all tactile_shear taxels to CSV while the Viser button is active."""
-
-    def __init__(self, save_dir: str, pad_labels: list[str], interval: int = 1):
-        self._save_dir = save_dir
-        self._pad_labels = list(pad_labels)
-        self._interval = max(1, int(interval))
-        os.makedirs(self._save_dir, exist_ok=True)
-        self._file = None
-        self._writer = None
-        self._path: str | None = None
-        self._frames = 0
-        self._rows = 0
-        self._file_count = len([f for f in os.listdir(self._save_dir) if f.endswith(".csv")])
-        self._prev_left_target_pos: np.ndarray | None = None
-        self._prev_right_target_pos: np.ndarray | None = None
-        self._prev_left_ee_pos: np.ndarray | None = None
-        self._prev_right_ee_pos: np.ndarray | None = None
-
-    @property
-    def active(self) -> bool:
-        return self._file is not None
-
-    @property
-    def num_frames(self) -> int:
-        return self._frames
-
-    @property
-    def num_rows(self) -> int:
-        return self._rows
-
-    @property
-    def path(self) -> str | None:
-        return self._path
-
-    def start(self) -> str:
-        if self.active:
-            return str(self._path)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fname = f"tactile_shear_{self._file_count:04d}_{ts}.csv"
-        self._path = os.path.join(self._save_dir, fname)
-        self._file = open(self._path, "w", newline="")
-        self._writer = csv.writer(self._file)
-        self._writer.writerow(
-            [
-                "frame",
-                "sim_step",
-                "pad",
-                "pad_label",
-                "row",
-                "col",
-                "shear_x",
-                "shear_y",
-                "arm",
-                "target_dx_w",
-                "target_dy_w",
-                "target_dz_w",
-                "ee_dx_w",
-                "ee_dy_w",
-                "ee_dz_w",
-                "pad_axis_x_wx",
-                "pad_axis_x_wy",
-                "pad_axis_x_wz",
-                "pad_axis_y_wx",
-                "pad_axis_y_wy",
-                "pad_axis_y_wz",
-                "target_delta_shear_x",
-                "target_delta_shear_y",
-                "ee_delta_shear_x",
-                "ee_delta_shear_y",
-            ]
-        )
-        self._frames = 0
-        self._rows = 0
-        self._prev_left_target_pos = None
-        self._prev_right_target_pos = None
-        self._prev_left_ee_pos = None
-        self._prev_right_ee_pos = None
-        self._file_count += 1
-        print(f"[SAVE] Tactile shear CSV started: {self._path}", flush=True)
-        return self._path
-
-    def record(
-        self,
-        obs: dict,
-        sim_step: int,
-        *,
-        left_target_pos: np.ndarray | None = None,
-        right_target_pos: np.ndarray | None = None,
-        left_ee_pos: np.ndarray | None = None,
-        right_ee_pos: np.ndarray | None = None,
-        pad_axes_w: dict[int, dict[str, np.ndarray]] | None = None,
-    ):
-        if not self.active or self._writer is None:
-            return
-        sim_step = int(sim_step)
-        if sim_step % self._interval != 0:
-            return
-        shear = tactile_shear_uv(obs.get("tactile_shear"))
-        if shear is None:
-            return
-        shear = np.asarray(shear)
-        if shear.ndim != 4 or shear.shape[-1] != 2:
-            return
-
-        def vec3(value) -> np.ndarray | None:
-            if value is None:
-                return None
-            return np.asarray(value, dtype=np.float64).reshape(3)
-
-        left_target = vec3(left_target_pos)
-        right_target = vec3(right_target_pos)
-        left_ee = vec3(left_ee_pos)
-        right_ee = vec3(right_ee_pos)
-
-        left_target_delta = np.zeros(3, dtype=np.float64) if self._prev_left_target_pos is None or left_target is None else left_target - self._prev_left_target_pos
-        right_target_delta = np.zeros(3, dtype=np.float64) if self._prev_right_target_pos is None or right_target is None else right_target - self._prev_right_target_pos
-        left_ee_delta = np.zeros(3, dtype=np.float64) if self._prev_left_ee_pos is None or left_ee is None else left_ee - self._prev_left_ee_pos
-        right_ee_delta = np.zeros(3, dtype=np.float64) if self._prev_right_ee_pos is None or right_ee is None else right_ee - self._prev_right_ee_pos
-
-        self._prev_left_target_pos = None if left_target is None else left_target.copy()
-        self._prev_right_target_pos = None if right_target is None else right_target.copy()
-        self._prev_left_ee_pos = None if left_ee is None else left_ee.copy()
-        self._prev_right_ee_pos = None if right_ee is None else right_ee.copy()
-
-        frame = self._frames
-        rows_out = []
-        for pad in range(shear.shape[0]):
-            pad_label = self._pad_labels[pad] if pad < len(self._pad_labels) else str(pad)
-            arm = "left" if pad < 2 else "right"
-            target_delta = left_target_delta if arm == "left" else right_target_delta
-            ee_delta = left_ee_delta if arm == "left" else right_ee_delta
-            pad_axes = (pad_axes_w or {}).get(pad, {})
-            axis_x_w = np.asarray(pad_axes.get("axis_x_w", np.zeros(3)), dtype=np.float64).reshape(3)
-            axis_y_w = np.asarray(pad_axes.get("axis_y_w", np.zeros(3)), dtype=np.float64).reshape(3)
-            target_delta_shear_x = float(np.dot(target_delta, axis_x_w))
-            target_delta_shear_y = float(np.dot(target_delta, axis_y_w))
-            ee_delta_shear_x = float(np.dot(ee_delta, axis_x_w))
-            ee_delta_shear_y = float(np.dot(ee_delta, axis_y_w))
-            for row in range(shear.shape[1]):
-                for col in range(shear.shape[2]):
-                    rows_out.append(
-                        [
-                            frame,
-                            sim_step,
-                            pad,
-                            pad_label,
-                            row,
-                            col,
-                            f"{float(shear[pad, row, col, 0]):.17g}",
-                            f"{float(shear[pad, row, col, 1]):.17g}",
-                            arm,
-                            f"{float(target_delta[0]):.17g}",
-                            f"{float(target_delta[1]):.17g}",
-                            f"{float(target_delta[2]):.17g}",
-                            f"{float(ee_delta[0]):.17g}",
-                            f"{float(ee_delta[1]):.17g}",
-                            f"{float(ee_delta[2]):.17g}",
-                            f"{float(axis_x_w[0]):.17g}",
-                            f"{float(axis_x_w[1]):.17g}",
-                            f"{float(axis_x_w[2]):.17g}",
-                            f"{float(axis_y_w[0]):.17g}",
-                            f"{float(axis_y_w[1]):.17g}",
-                            f"{float(axis_y_w[2]):.17g}",
-                            f"{target_delta_shear_x:.17g}",
-                            f"{target_delta_shear_y:.17g}",
-                            f"{ee_delta_shear_x:.17g}",
-                            f"{ee_delta_shear_y:.17g}",
-                        ]
-                    )
-        self._writer.writerows(rows_out)
-        self._frames += 1
-        self._rows += len(rows_out)
-        if self._frames % 30 == 0 and self._file is not None:
-            self._file.flush()
-
-    def stop(self) -> str | None:
-        if not self.active:
-            return self._path
-        assert self._file is not None
-        self._file.flush()
-        self._file.close()
-        self._file = None
-        self._writer = None
-        path = self._path
-        print(f"[SAVE] Tactile shear CSV saved: {path} ({self._frames} frames, {self._rows} rows)", flush=True)
-        return path
 
 
 # ---------------------------------------------------------------------------
@@ -1151,30 +539,6 @@ def create_viser_server(port: int, cfg=None):
     def _(_):
         shared.request_reset()
 
-    record_btn = server.gui.add_button("Start Recording", color="green")
-
-    @record_btn.on_click
-    def _(_):
-        is_recording = shared.is_recording()
-        shared.set_recording(not is_recording)
-        record_btn.name = "Start Recording" if is_recording else "Stop Recording"
-        record_btn.color = "green" if is_recording else "orange"
-
-    shear_csv_btn = server.gui.add_button("Start Shear CSV", color="blue")
-
-    @shear_csv_btn.on_click
-    def _(_):
-        is_recording = shared.is_shear_csv_recording()
-        shared.set_shear_csv_recording(not is_recording)
-        shear_csv_btn.name = "Start Shear CSV" if is_recording else "Stop Shear CSV"
-        shear_csv_btn.color = "blue" if is_recording else "orange"
-
-    hydro_sample_btn = server.gui.add_button("Save Hydro Samples", color="blue")
-
-    @hydro_sample_btn.on_click
-    def _(_):
-        shared.request_hydro_sample_dump()
-
     show_shear_arrows = server.gui.add_checkbox("Show shear arrows", initial_value=True)
 
     @show_shear_arrows.on_update
@@ -1183,11 +547,9 @@ def create_viser_server(port: int, cfg=None):
 
     shared.set_show_shear_arrows(bool(show_shear_arrows.value))
 
-    hydro_enabled = getattr(cfg.tactile, "enable_hydro_normal_observation", False)
     main_shear_enabled = bool(getattr(cfg.tactile.backend, "include_force_observations", False))
     bump_enabled = bool(getattr(cfg.tactile.backend, "bump_enabled", False))
     main_backend_is_hydroshear = "HydroShear" in type(cfg.tactile.backend).__name__
-    marker_display_enabled = bool(main_shear_enabled and not bump_enabled)
     dummy_img = np.zeros((96, 256, 3), dtype=np.uint8)
     pad_labels = [
         "Left arm / left finger",
@@ -1200,19 +562,9 @@ def create_viser_server(port: int, cfg=None):
             server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
             for label in pad_labels
         ]
-    hydro_handles = []
     main_shear_x_handles = []
     main_shear_y_handles = []
     main_shear_mag_handles = []
-    hydro_shear_x_handles = []
-    hydro_shear_y_handles = []
-    hydro_shear_mag_handles = []
-    marker_shear_x_handles = []
-    marker_shear_y_handles = []
-    marker_shear_mag_handles = []
-    marker_combined_x_handles = []
-    marker_combined_y_handles = []
-    marker_combined_mag_handles = []
     if main_shear_enabled:
         with server.gui.add_folder("Force Shear X"):
             main_shear_x_handles = [
@@ -1226,58 +578,6 @@ def create_viser_server(port: int, cfg=None):
             ]
         with server.gui.add_folder("Force Shear Magnitude"):
             main_shear_mag_handles = [
-                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
-                for label in pad_labels
-            ]
-        if marker_display_enabled:
-            with server.gui.add_folder("Marker Shear X"):
-                marker_shear_x_handles = [
-                    server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
-                    for label in pad_labels
-                ]
-            with server.gui.add_folder("Marker Shear Y"):
-                marker_shear_y_handles = [
-                    server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
-                    for label in pad_labels
-                ]
-            with server.gui.add_folder("Marker Shear Magnitude"):
-                marker_shear_mag_handles = [
-                    server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
-                    for label in pad_labels
-                ]
-            with server.gui.add_folder("Marker Combined X"):
-                marker_combined_x_handles = [
-                    server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
-                    for label in pad_labels
-                ]
-            with server.gui.add_folder("Marker Combined Y"):
-                marker_combined_y_handles = [
-                    server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
-                    for label in pad_labels
-                ]
-            with server.gui.add_folder("Marker Combined Magnitude"):
-                marker_combined_mag_handles = [
-                    server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
-                    for label in pad_labels
-                ]
-    if hydro_enabled:
-        with server.gui.add_folder("Hydro Normal"):
-            hydro_handles = [
-                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
-                for label in pad_labels
-            ]
-        with server.gui.add_folder("Hydro Shear X"):
-            hydro_shear_x_handles = [
-                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
-                for label in pad_labels
-            ]
-        with server.gui.add_folder("Hydro Shear Y"):
-            hydro_shear_y_handles = [
-                server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
-                for label in pad_labels
-            ]
-        with server.gui.add_folder("Hydro Shear Magnitude"):
-            hydro_shear_mag_handles = [
                 server.gui.add_image(dummy_img, label=label, format="jpeg", jpeg_quality=80)
                 for label in pad_labels
             ]
@@ -1311,30 +611,15 @@ def create_viser_server(port: int, cfg=None):
         "right_ee_gizmo": None,
         "left_gripper_slider": left_slider,
         "right_gripper_slider": right_slider,
-        "record_btn": record_btn,
-        "shear_csv_btn": shear_csv_btn,
-        "hydro_sample_btn": hydro_sample_btn,
         "tactile_shear_arrows": tactile_shear_arrows,
         "tac_handles": tac_handles,
-        "hydro_handles": hydro_handles,
         "main_shear_x_handles": main_shear_x_handles,
         "main_shear_y_handles": main_shear_y_handles,
         "main_shear_mag_handles": main_shear_mag_handles,
-        "hydro_shear_x_handles": hydro_shear_x_handles,
-        "hydro_shear_y_handles": hydro_shear_y_handles,
-        "hydro_shear_mag_handles": hydro_shear_mag_handles,
-        "marker_shear_x_handles": marker_shear_x_handles,
-        "marker_shear_y_handles": marker_shear_y_handles,
-        "marker_shear_mag_handles": marker_shear_mag_handles,
-        "marker_combined_x_handles": marker_combined_x_handles,
-        "marker_combined_y_handles": marker_combined_y_handles,
-        "marker_combined_mag_handles": marker_combined_mag_handles,
         "state_md": state_md,
         "camera_img": camera_img,
         "bump_enabled": bump_enabled,
         "main_backend_is_hydroshear": main_backend_is_hydroshear,
-        "marker_display_enabled": marker_display_enabled,
-        "compare_hydro_enabled": bool(hydro_enabled),
         "last_shear_arrow_count": 0,
         "last_shear_arrow_max_mag": 0.0,
         "shear_arrow_capacity": 128,
@@ -1365,30 +650,6 @@ def load_scene_objects(server, handles, cfg):
 
     asset_root = os.path.expanduser(objects_cfg.asset_root)
     automate_dir = os.path.join(asset_root, "automate_scaled", "urdf")
-
-    if bool(getattr(objects_cfg, "use_cube_objects", False)):
-        import trimesh
-
-        def pose_wxyz(pose):
-            return (float(pose[6]), float(pose[3]), float(pose[4]), float(pose[5]))
-
-        def add_cube(name: str, pose, color):
-            mesh = trimesh.creation.box(extents=tuple(float(v) for v in objects_cfg.cube_size))
-            mesh.visual.face_colors = color
-            return server.scene.add_mesh_trimesh(
-                name,
-                mesh,
-                position=tuple(float(v) for v in pose[:3]),
-                wxyz=pose_wxyz(pose),
-            )
-
-        if objects_cfg.enable_plug:
-            handles["plug_mesh"] = add_cube("/plug_cube", objects_cfg.plug_default_pose, (48, 96, 230, 230))
-            print("[viser] Plug cube loaded.", flush=True)
-        if objects_cfg.enable_socket:
-            handles["socket_mesh"] = add_cube("/socket_cube", objects_cfg.socket_default_pose, (230, 128, 48, 230))
-            print("[viser] Socket cube loaded.", flush=True)
-        return
 
     if objects_cfg.enable_plug:
         import trimesh
@@ -1474,16 +735,9 @@ def _unit_vec(vec: np.ndarray) -> np.ndarray:
 def _grid_center_offsets(rows: int, cols: int) -> tuple[np.ndarray, np.ndarray]:
     rows = max(1, int(rows))
     cols = max(1, int(cols))
-    pitch_mm = 8.75
-    border_plus_radius_mm = 6.0
-    target_u_m = 0.026
-    target_v_m = 0.06665
-    source_u_mm = float(rows - 1) * pitch_mm + 2.0 * border_plus_radius_mm
-    source_v_mm = float(cols - 1) * pitch_mm + 2.0 * border_plus_radius_mm
-    u_scale = target_u_m / max(source_u_mm, 1.0e-12)
-    v_scale = target_v_m / max(source_v_mm, 1.0e-12)
-    u = (np.arange(rows, dtype=np.float64) - (rows - 1) / 2.0) * pitch_mm * u_scale
-    v = (np.arange(cols, dtype=np.float64) - (cols - 1) / 2.0) * pitch_mm * v_scale
+    pitch_m = 0.004
+    u = (np.arange(rows, dtype=np.float64) - (rows - 1) / 2.0) * pitch_m
+    v = (np.arange(cols, dtype=np.float64) - (cols - 1) / 2.0) * pitch_m
     return u, v
 
 
@@ -1650,40 +904,21 @@ def update_scene_slow(
     left_gripper,
     right_gripper,
     step,
-    recording,
-    rec_steps,
-    shear_csv_recording=False,
-    shear_csv_frames=0,
-    shear_csv_rows=0,
 ):
     tactile = obs["tactile"]
     tactile_force = obs.get("tactile_force")
     tactile_shear = tactile_shear_uv(obs.get("tactile_shear"))
-    tactile_marker_shear = tactile_marker_vector_uv(obs.get("tactile_marker_shear"))
-    tactile_marker_combined = tactile_marker_vector_uv(obs.get("tactile_marker"))
-    tactile_hydro = obs.get("tactile_hydro")
-    tactile_hydro_shear = tactile_shear_uv(obs.get("tactile_hydro_marker_shear"))
-    if tactile_hydro_shear is None:
-        tactile_hydro_shear = tactile_shear_uv(obs.get("tactile_hydro_shear"))
     contact_count = np.asarray(obs.get("tactile_contact_count", np.zeros(4)), dtype=np.float32).reshape(-1)
     bump_contact_count = np.asarray(obs.get("tactile_bump_contact_count", np.zeros(4)), dtype=np.float32).reshape(-1)
     max_penetration = np.asarray(obs.get("tactile_max_penetration", np.zeros(4)), dtype=np.float32).reshape(-1)
     min_sdf = np.asarray(obs.get("tactile_min_sdf", np.zeros(4)), dtype=np.float32).reshape(-1)
+
     tac_maxes = []
-    main_shear_x_ranges = []
-    main_shear_y_ranges = []
-    main_shear_mag_maxes = []
-    marker_shear_x_ranges = []
-    marker_shear_y_ranges = []
-    marker_shear_mag_maxes = []
-    marker_combined_x_ranges = []
-    marker_combined_y_ranges = []
-    marker_combined_mag_maxes = []
-    hydro_maxes = []
+    force_normal_maxes = []
     shear_x_ranges = []
     shear_y_ranges = []
     shear_mag_maxes = []
-    force_normal_maxes = []
+
     for i, handle in enumerate(handles["tac_handles"]):
         grid = tactile[i]
         grid_normal = tactile_normal_channel(grid)
@@ -1691,48 +926,13 @@ def update_scene_slow(
         if tactile_force is not None:
             force_normal_grid = tactile_normal_channel(tactile_force[i])
             force_normal_maxes.append(float(force_normal_grid.max()))
-        main_shear_grid = tactile_shear[i] if tactile_shear is not None else None
-        if main_shear_grid is not None:
-            sx = main_shear_grid[:, :, 0]
-            sy = main_shear_grid[:, :, 1]
-            mag = np.linalg.norm(main_shear_grid, axis=-1)
-            main_shear_x_ranges.append((float(sx.min()), float(sx.max())))
-            main_shear_y_ranges.append((float(sy.min()), float(sy.max())))
-            main_shear_mag_maxes.append(float(mag.max()))
-        marker_shear_grid = tactile_marker_shear[i] if tactile_marker_shear is not None else None
-        if marker_shear_grid is not None:
-            sx = marker_shear_grid[:, :, 0]
-            sy = marker_shear_grid[:, :, 1]
-            mag = np.linalg.norm(marker_shear_grid, axis=-1)
-            marker_shear_x_ranges.append((float(sx.min()), float(sx.max())))
-            marker_shear_y_ranges.append((float(sy.min()), float(sy.max())))
-            marker_shear_mag_maxes.append(float(mag.max()))
-        marker_combined_grid = tactile_marker_combined[i] if tactile_marker_combined is not None else None
-        if marker_combined_grid is not None:
-            sx = marker_combined_grid[:, :, 0]
-            sy = marker_combined_grid[:, :, 1]
-            mag = np.linalg.norm(marker_combined_grid, axis=-1)
-            marker_combined_x_ranges.append((float(sx.min()), float(sx.max())))
-            marker_combined_y_ranges.append((float(sy.min()), float(sy.max())))
-            marker_combined_mag_maxes.append(float(mag.max()))
-        hydro_grid = tactile_hydro[i] if tactile_hydro is not None else None
-        if hydro_grid is not None:
-            hydro_normal = tactile_normal_channel(hydro_grid)
-            hydro_maxes.append(float(hydro_normal.max()))
-        shear_grid = tactile_hydro_shear[i] if tactile_hydro_shear is not None else None
-        if shear_grid is not None:
-            sx = shear_grid[:, :, 0]
-            sy = shear_grid[:, :, 1]
-            mag = np.linalg.norm(shear_grid, axis=-1)
-            shear_x_ranges.append((float(sx.min()), float(sx.max())))
-            shear_y_ranges.append((float(sy.min()), float(sy.max())))
-            shear_mag_maxes.append(float(mag.max()))
+
         if bool(handles.get("bump_enabled", False)):
             normal_label = "bump normal"
         elif bool(handles.get("main_backend_is_hydroshear", False)):
             normal_label = "hydro normal"
         else:
-            normal_label = "orig normal"
+            normal_label = "normal"
         try:
             handle.image = _label_rgb(
                 tactile_to_rgb(grid_normal),
@@ -1740,147 +940,47 @@ def update_scene_slow(
             )
         except Exception:
             pass
-        if main_shear_grid is not None:
-            sx = main_shear_grid[:, :, 0]
-            sy = main_shear_grid[:, :, 1]
-            mag = np.linalg.norm(main_shear_grid, axis=-1)
-            sx_vis = _apply_shear_vis_deadband(sx)
-            sy_vis = _apply_shear_vis_deadband(sy)
-            mag_vis = np.linalg.norm(np.stack((sx_vis, sy_vis), axis=-1), axis=-1)
-            signed_vmax = _shear_vis_vmax(sx_vis, sy_vis)
-            mag_vmax = _shear_vis_vmax(mag_vis)
-            if i < len(handles.get("main_shear_x_handles", [])):
-                try:
-                    handles["main_shear_x_handles"][i].image = _label_rgb(
-                        signed_tactile_to_rgb(sx_vis, vmax=signed_vmax),
-                        f"x min {_fmt_scalar(float(sx.min()))}\nx max {_fmt_scalar(float(sx.max()))}",
-                    )
-                except Exception:
-                    pass
-            if i < len(handles.get("main_shear_y_handles", [])):
-                try:
-                    handles["main_shear_y_handles"][i].image = _label_rgb(
-                        signed_tactile_to_rgb(sy_vis, vmax=signed_vmax),
-                        f"y min {_fmt_scalar(float(sy.min()))}\ny max {_fmt_scalar(float(sy.max()))}",
-                    )
-                except Exception:
-                    pass
-            if i < len(handles.get("main_shear_mag_handles", [])):
-                try:
-                    handles["main_shear_mag_handles"][i].image = _label_rgb(
-                        positive_tactile_to_rgb(mag_vis, vmax=mag_vmax),
-                        f"|s| max={_fmt_scalar(float(mag.max()))}",
-                    )
-                except Exception:
-                    pass
-        if marker_shear_grid is not None:
-            sx = marker_shear_grid[:, :, 0]
-            sy = marker_shear_grid[:, :, 1]
-            mag = np.linalg.norm(marker_shear_grid, axis=-1)
-            sx_vis = _apply_shear_vis_deadband(sx)
-            sy_vis = _apply_shear_vis_deadband(sy)
-            mag_vis = np.linalg.norm(np.stack((sx_vis, sy_vis), axis=-1), axis=-1)
-            signed_vmax = _shear_vis_vmax(sx_vis, sy_vis)
-            mag_vmax = _shear_vis_vmax(mag_vis)
-            if i < len(handles.get("marker_shear_x_handles", [])):
-                try:
-                    handles["marker_shear_x_handles"][i].image = _label_rgb(
-                        signed_tactile_to_rgb(sx_vis, vmax=signed_vmax),
-                        f"x min {_fmt_scalar(float(sx.min()))}\nx max {_fmt_scalar(float(sx.max()))}",
-                    )
-                except Exception:
-                    pass
-            if i < len(handles.get("marker_shear_y_handles", [])):
-                try:
-                    handles["marker_shear_y_handles"][i].image = _label_rgb(
-                        signed_tactile_to_rgb(sy_vis, vmax=signed_vmax),
-                        f"y min {_fmt_scalar(float(sy.min()))}\ny max {_fmt_scalar(float(sy.max()))}",
-                    )
-                except Exception:
-                    pass
-            if i < len(handles.get("marker_shear_mag_handles", [])):
-                try:
-                    handles["marker_shear_mag_handles"][i].image = _label_rgb(
-                        positive_tactile_to_rgb(mag_vis, vmax=mag_vmax),
-                        f"|s| max={_fmt_scalar(float(mag.max()))}",
-                    )
-                except Exception:
-                    pass
-        if marker_combined_grid is not None:
-            sx = marker_combined_grid[:, :, 0]
-            sy = marker_combined_grid[:, :, 1]
-            mag = np.linalg.norm(marker_combined_grid, axis=-1)
-            sx_vis = _apply_shear_vis_deadband(sx)
-            sy_vis = _apply_shear_vis_deadband(sy)
-            mag_vis = np.linalg.norm(np.stack((sx_vis, sy_vis), axis=-1), axis=-1)
-            signed_vmax = _shear_vis_vmax(sx_vis, sy_vis)
-            mag_vmax = _shear_vis_vmax(mag_vis)
-            if i < len(handles.get("marker_combined_x_handles", [])):
-                try:
-                    handles["marker_combined_x_handles"][i].image = _label_rgb(
-                        signed_tactile_to_rgb(sx_vis, vmax=signed_vmax),
-                        f"x min {_fmt_scalar(float(sx.min()))}\nx max {_fmt_scalar(float(sx.max()))}",
-                    )
-                except Exception:
-                    pass
-            if i < len(handles.get("marker_combined_y_handles", [])):
-                try:
-                    handles["marker_combined_y_handles"][i].image = _label_rgb(
-                        signed_tactile_to_rgb(sy_vis, vmax=signed_vmax),
-                        f"y min {_fmt_scalar(float(sy.min()))}\ny max {_fmt_scalar(float(sy.max()))}",
-                    )
-                except Exception:
-                    pass
-            if i < len(handles.get("marker_combined_mag_handles", [])):
-                try:
-                    handles["marker_combined_mag_handles"][i].image = _label_rgb(
-                        positive_tactile_to_rgb(mag_vis, vmax=mag_vmax),
-                        f"|m| max={_fmt_scalar(float(mag.max()))}",
-                    )
-                except Exception:
-                    pass
-        if hydro_grid is not None and i < len(handles.get("hydro_handles", [])):
-            hydro_normal = tactile_normal_channel(hydro_grid)
+
+        shear_grid = tactile_shear[i] if tactile_shear is not None else None
+        if shear_grid is None:
+            continue
+        sx = shear_grid[:, :, 0]
+        sy = shear_grid[:, :, 1]
+        mag = np.linalg.norm(shear_grid, axis=-1)
+        shear_x_ranges.append((float(sx.min()), float(sx.max())))
+        shear_y_ranges.append((float(sy.min()), float(sy.max())))
+        shear_mag_maxes.append(float(mag.max()))
+
+        sx_vis = _apply_shear_vis_deadband(sx)
+        sy_vis = _apply_shear_vis_deadband(sy)
+        mag_vis = np.linalg.norm(np.stack((sx_vis, sy_vis), axis=-1), axis=-1)
+        signed_vmax = _shear_vis_vmax(sx_vis, sy_vis)
+        mag_vmax = _shear_vis_vmax(mag_vis)
+
+        if i < len(handles.get("main_shear_x_handles", [])):
             try:
-                handles["hydro_handles"][i].image = _label_rgb(
-                    tactile_to_rgb(hydro_normal),
-                    f"hydro max={_fmt_scalar(float(hydro_normal.max()))}",
+                handles["main_shear_x_handles"][i].image = _label_rgb(
+                    signed_tactile_to_rgb(sx_vis, vmax=signed_vmax),
+                    f"x min {_fmt_scalar(float(sx.min()))}\nx max {_fmt_scalar(float(sx.max()))}",
                 )
             except Exception:
                 pass
-        if shear_grid is not None:
-            sx = shear_grid[:, :, 0]
-            sy = shear_grid[:, :, 1]
-            mag = np.linalg.norm(shear_grid, axis=-1)
-            sx_vis = _apply_shear_vis_deadband(sx)
-            sy_vis = _apply_shear_vis_deadband(sy)
-            mag_vis = np.linalg.norm(np.stack((sx_vis, sy_vis), axis=-1), axis=-1)
-            signed_vmax = _shear_vis_vmax(sx_vis, sy_vis)
-            mag_vmax = _shear_vis_vmax(mag_vis)
-            if i < len(handles.get("hydro_shear_x_handles", [])):
-                try:
-                    handles["hydro_shear_x_handles"][i].image = _label_rgb(
-                        signed_tactile_to_rgb(sx_vis, vmax=signed_vmax),
-                        f"x min {_fmt_scalar(float(sx.min()))}\nx max {_fmt_scalar(float(sx.max()))}",
-                    )
-                except Exception:
-                    pass
-            if i < len(handles.get("hydro_shear_y_handles", [])):
-                try:
-                    handles["hydro_shear_y_handles"][i].image = _label_rgb(
-                        signed_tactile_to_rgb(sy_vis, vmax=signed_vmax),
-                        f"y min {_fmt_scalar(float(sy.min()))}\ny max {_fmt_scalar(float(sy.max()))}",
-                    )
-                except Exception:
-                    pass
-            if i < len(handles.get("hydro_shear_mag_handles", [])):
-                try:
-                    handles["hydro_shear_mag_handles"][i].image = _label_rgb(
-                        positive_tactile_to_rgb(mag_vis, vmax=mag_vmax),
-                        f"|s| max={_fmt_scalar(float(mag.max()))}",
-                    )
-                except Exception:
-                    pass
+        if i < len(handles.get("main_shear_y_handles", [])):
+            try:
+                handles["main_shear_y_handles"][i].image = _label_rgb(
+                    signed_tactile_to_rgb(sy_vis, vmax=signed_vmax),
+                    f"y min {_fmt_scalar(float(sy.min()))}\ny max {_fmt_scalar(float(sy.max()))}",
+                )
+            except Exception:
+                pass
+        if i < len(handles.get("main_shear_mag_handles", [])):
+            try:
+                handles["main_shear_mag_handles"][i].image = _label_rgb(
+                    positive_tactile_to_rgb(mag_vis, vmax=mag_vmax),
+                    f"|s| max={_fmt_scalar(float(mag.max()))}",
+                )
+            except Exception:
+                pass
 
     if "rgb" in obs:
         try:
@@ -1888,133 +988,35 @@ def update_scene_slow(
         except Exception:
             pass
 
-    rec_status = f"  **REC** ({rec_steps} steps)" if recording else ""
-    shear_csv_status = (
-        f"REC ({int(shear_csv_frames)} frames, {int(shear_csv_rows)} rows)" if shear_csv_recording else "idle"
-    )
     tac_str = ", ".join(_fmt_scalar(m) for m in tac_maxes)
     contact_str = ", ".join(_fmt_scalar(float(v)) for v in contact_count[:4])
     bump_contact_str = ", ".join(_fmt_scalar(float(v)) for v in bump_contact_count[:4])
     max_pen_str = ", ".join(_fmt_scalar(float(v)) for v in max_penetration[:4])
     min_sdf_str = ", ".join(_fmt_scalar(float(v)) for v in min_sdf[:4])
-    force_normal_str = (
-        ", ".join(_fmt_scalar(m) for m in force_normal_maxes) if force_normal_maxes else "disabled"
-    )
-    main_sx_str = (
-        ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in main_shear_x_ranges)
-        if main_shear_x_ranges
+    force_normal_str = ", ".join(_fmt_scalar(m) for m in force_normal_maxes) if force_normal_maxes else "disabled"
+    shear_x_str = (
+        ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in shear_x_ranges)
+        if shear_x_ranges
         else "disabled"
     )
-    main_sy_str = (
-        ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in main_shear_y_ranges)
-        if main_shear_y_ranges
+    shear_y_str = (
+        ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in shear_y_ranges)
+        if shear_y_ranges
         else "disabled"
     )
-    main_smag_str = (
-        ", ".join(_fmt_scalar(m) for m in main_shear_mag_maxes) if main_shear_mag_maxes else "disabled"
-    )
-    marker_sx_str = (
-        ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in marker_shear_x_ranges)
-        if marker_shear_x_ranges
-        else "disabled"
-    )
-    marker_sy_str = (
-        ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in marker_shear_y_ranges)
-        if marker_shear_y_ranges
-        else "disabled"
-    )
-    marker_smag_str = (
-        ", ".join(_fmt_scalar(m) for m in marker_shear_mag_maxes) if marker_shear_mag_maxes else "disabled"
-    )
-    marker_combined_sx_str = (
-        ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in marker_combined_x_ranges)
-        if marker_combined_x_ranges
-        else "disabled"
-    )
-    marker_combined_sy_str = (
-        ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in marker_combined_y_ranges)
-        if marker_combined_y_ranges
-        else "disabled"
-    )
-    marker_combined_smag_str = (
-        ", ".join(_fmt_scalar(m) for m in marker_combined_mag_maxes)
-        if marker_combined_mag_maxes
-        else "disabled"
-    )
-    compare_hydro_enabled = bool(handles.get("compare_hydro_enabled", False))
-    if compare_hydro_enabled and hydro_maxes:
-        hydro_str = ", ".join(_fmt_scalar(m) for m in hydro_maxes)
-        sx_str = (
-            ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in shear_x_ranges)
-            if shear_x_ranges
-            else "disabled"
-        )
-        sy_str = (
-            ", ".join(f"[{_fmt_scalar(lo)},{_fmt_scalar(hi)}]" for lo, hi in shear_y_ranges)
-            if shear_y_ranges
-            else "disabled"
-        )
-        smag_str = ", ".join(_fmt_scalar(m) for m in shear_mag_maxes) if shear_mag_maxes else "disabled"
-        normal_table = (
-            "| Pad | Orig normal max | Hydro normal max | Hydro shear-x min/max | Hydro shear-y min/max | Hydro \\|shear\\| max |\n"
-            "| --- | ---: | ---: | ---: | ---: | ---: |\n"
-            + "\n".join(
-                f"| {label} | {_fmt_scalar(orig)} | {_fmt_scalar(hydro)} | "
-                f"[{_fmt_scalar(sx[0])},{_fmt_scalar(sx[1])}] | "
-                f"[{_fmt_scalar(sy[0])},{_fmt_scalar(sy[1])}] | {_fmt_scalar(smag)} |"
-                for label, orig, hydro, sx, sy, smag in zip(
-                    ("L-L", "L-R", "R-L", "R-R"),
-                    tac_maxes,
-                    hydro_maxes,
-                    shear_x_ranges or [(0.0, 0.0)] * len(hydro_maxes),
-                    shear_y_ranges or [(0.0, 0.0)] * len(hydro_maxes),
-                    shear_mag_maxes or [0.0] * len(hydro_maxes),
-                    strict=False,
-                )
-            )
-        )
-    else:
-        hydro_str = "disabled"
-        sx_str = "disabled"
-        sy_str = "disabled"
-        smag_str = "disabled"
-        normal_table = ""
-    if bool(handles.get("bump_enabled", False)):
-        main_force_label = "Bump force"
-    elif bool(handles.get("main_backend_is_hydroshear", False)):
-        main_force_label = "Hydro force"
-    else:
-        main_force_label = "Force"
-    marker_block = ""
-    if bool(handles.get("marker_display_enabled", False)):
-        marker_block = (
-            f"**Marker shear-x min/max [4 pads]:** [{marker_sx_str}]  \n"
-            f"**Marker shear-y min/max [4 pads]:** [{marker_sy_str}]  \n"
-            f"**Marker |shear| max [4 pads]:** [{marker_smag_str}]  \n"
-            f"**Marker combined-x min/max [4 pads]:** [{marker_combined_sx_str}]  \n"
-            f"**Marker combined-y min/max [4 pads]:** [{marker_combined_sy_str}]  \n"
-            f"**Marker combined |xy| max [4 pads]:** [{marker_combined_smag_str}]  \n"
-        )
-    compare_block = ""
-    if compare_hydro_enabled:
-        compare_block = (
-            f"**Compare Hydro normal max [4 pads]:** [{hydro_str}]  \n"
-            f"**Compare Hydro shear-x min/max [4 pads]:** [{sx_str}]  \n"
-            f"**Compare Hydro shear-y min/max [4 pads]:** [{sy_str}]  \n"
-            f"**Compare Hydro |shear| max [4 pads]:** [{smag_str}]  \n"
-            f"{normal_table}\n"
-        )
+    shear_mag_str = ", ".join(_fmt_scalar(m) for m in shear_mag_maxes) if shear_mag_maxes else "disabled"
+    force_label = "Bump force" if bool(handles.get("bump_enabled", False)) else "Hydro force"
     shear_vis_vmax = max(0.0, float(getattr(args, "shear_vis_vmax", 0.0)))
     shear_vis_vmax_str = "auto" if shear_vis_vmax <= 0.0 else _fmt_scalar(shear_vis_vmax)
     shear_vis_deadband_str = _fmt_scalar(_shear_vis_deadband())
     shear_arrow_count = int(handles.get("last_shear_arrow_count", 0))
     shear_arrow_max = float(handles.get("last_shear_arrow_max_mag", 0.0))
+
     handles["state_md"].content = (
         f"**Left EE:** ({left_ee[0]:.4f}, {left_ee[1]:.4f}, {left_ee[2]:.4f})  \n"
         f"**Right EE:** ({right_ee[0]:.4f}, {right_ee[1]:.4f}, {right_ee[2]:.4f})  \n"
         f"**Left gripper:** {left_gripper:.2f}  \n"
         f"**Right gripper:** {right_gripper:.2f}  \n"
-        f"**Shear CSV:** {shear_csv_status}  \n"
         f"**Shear vis:** vmax={shear_vis_vmax_str}, deadband={shear_vis_deadband_str} display-only  \n"
         f"**Shear arrows:** count={shear_arrow_count}, max={_fmt_scalar(shear_arrow_max)}  \n"
         f"**Pad axes:** cyan=shear_x, orange=shear_y, green=normal  \n"
@@ -2023,13 +1025,11 @@ def update_scene_slow(
         f"**Max penetration [4 pads]:** [{max_pen_str}]  \n"
         f"**Min SDF [4 pads]:** [{min_sdf_str}]  \n"
         f"**Tactile max [4 pads]:** [{tac_str}]  \n"
-        f"**{main_force_label} normal max [4 pads]:** [{force_normal_str}]  \n"
-        f"**{main_force_label} shear-x min/max [4 pads]:** [{main_sx_str}]  \n"
-        f"**{main_force_label} shear-y min/max [4 pads]:** [{main_sy_str}]  \n"
-        f"**{main_force_label} |shear| max [4 pads]:** [{main_smag_str}]  \n"
-        f"{marker_block}"
-        f"{compare_block}"
-        f"**Step:** {step}{rec_status}"
+        f"**{force_label} normal max [4 pads]:** [{force_normal_str}]  \n"
+        f"**{force_label} shear-x min/max [4 pads]:** [{shear_x_str}]  \n"
+        f"**{force_label} shear-y min/max [4 pads]:** [{shear_y_str}]  \n"
+        f"**{force_label} |shear| max [4 pads]:** [{shear_mag_str}]  \n"
+        f"**Step:** {step}"
     )
 
 
@@ -2089,10 +1089,11 @@ def compute_pose(ik_ctrl, target_pos, target_quat, gripper):
 
 def main():
     port = int(args.port)
+    camera_enabled = bool(getattr(args, "enable_cameras", False) or bool(args.save_camera_renders))
 
     cfg = AlohaTactileEnvCfg(
         camera=AlohaCameraCfg(
-            enable_camera=True,
+            enable_camera=camera_enabled,
             save_renders=bool(args.save_camera_renders),
             render_output_dir=str(args.render_output_dir),
         ),
@@ -2105,34 +1106,10 @@ def main():
         cfg.robot.urdf_path = str(Path(os.path.expanduser(args.robot_urdf)).resolve())
     elif bool(args.use_bump_pad):
         cfg.robot.urdf_path = str((Path(__file__).resolve().parent / "assets" / "aloha_tactile_bump.urdf").resolve())
-    if args.tactile_backend == "taxel_shear":
-        cfg.tactile.backend = TaxelShearTactileBackendCfg()
-    elif args.tactile_backend == "surface_hydro":
-        cfg.tactile.backend = HydroShearTactileBackendCfg(
-            include_force_observations=True,
-            bump_enabled=bool(args.use_bump_pad),
-        )
-    cfg.tactile.enable_hydro_normal_observation = bool(args.compare_hydro_normal)
-    cfg.tactile.hydro_normal_backend.include_force_observations = bool(args.compare_hydro_normal)
-    cfg.tactile.hydro_normal_backend.bump_enabled = bool(args.use_bump_pad)
-    cfg.tactile.hydro_normal_backend.normal_readout_scale = float(args.hydro_normal_scale)
-    cfg.tactile.hydro_normal_backend.shear_readout_scale = float(args.hydro_shear_scale)
-    if args.hydro_shear_stiffness is not None:
-        cfg.tactile.hydro_normal_backend.shear_stiffness = float(args.hydro_shear_stiffness)
-    if args.object_shape == "cube":
-        cube_side = float(args.cube_side)
-        cube_z = cube_side * 0.5 + 0.001
-        cfg.objects.use_cube_objects = True
-        cfg.objects.enable_plug = True
-        cfg.objects.enable_socket = True
-        cfg.objects.cube_size = (cube_side, cube_side, cube_side)
-        cfg.objects.cube_mass = 0.04
-        cfg.objects.plug_fix_base = bool(args.cube_fix_base)
-        cfg.objects.socket_fix_base = bool(args.cube_fix_base)
-        cfg.objects.plug_scale = 1.0
-        cfg.objects.socket_scale = 1.0
-        cfg.objects.plug_default_pose = (0.0, 0.05, cube_z, 0.0, 0.0, 0.0, 1.0)
-        cfg.objects.socket_default_pose = (0.0, -0.05, cube_z, 0.0, 0.0, 0.0, 1.0)
+    cfg.tactile.backend = HydroShearTactileBackendCfg(
+        include_force_observations=True,
+        bump_enabled=bool(args.use_bump_pad),
+    )
 
     elastomer_meshes = _elastomer_meshes_from_urdf(str(cfg.robot.urdf_path))
     print(
@@ -2181,26 +1158,6 @@ def main():
     left_ee_quat_init = left_ik.get_ee_quat()
     right_ee_quat_init = right_ik.get_ee_quat()
 
-    save_dir = args.save_dir or os.path.join(os.path.dirname(__file__), "output", "trajectories")
-    recorder = TrajectoryRecorder(save_dir)
-    print(f"[INFO] Trajectories will be saved to: {save_dir}", flush=True)
-    shear_csv_dir = args.shear_csv_dir or os.path.join(os.path.dirname(__file__), "output", "tactile_shear_csv")
-    shear_csv_recorder = TactileShearCsvRecorder(
-        shear_csv_dir,
-        pad_labels=[
-            "Left arm / left finger",
-            "Left arm / right finger",
-            "Right arm / left finger",
-            "Right arm / right finger",
-        ],
-        interval=int(args.shear_csv_interval),
-    )
-    print(f"[INFO] Tactile shear CSV will be saved to: {shear_csv_dir}", flush=True)
-    hydro_sample_debug_dir = args.hydro_sample_debug_dir or os.path.join(
-        os.path.dirname(__file__), "output", "hydroshear_sample_debug", "live"
-    )
-    print(f"[INFO] Hydro sample debug dumps will be saved to: {hydro_sample_debug_dir}", flush=True)
-
     handles["state_md"].content = "**Loading 3D models...**"
     load_scene_objects(server, handles, cfg)
     create_ee_gizmo(server, handles, "left", left_ee_target_pos, left_ee_quat_init)
@@ -2229,43 +1186,9 @@ def main():
 
     step = 0
     slow_interval = max(1, int(args.slow_interval))
-    was_recording = False
-    was_shear_csv_recording = False
 
     while simulation_app.is_running():
-        recording = shared.is_recording()
-        shear_csv_recording = shared.is_shear_csv_recording()
-
-        if was_recording and not recording:
-            path = recorder.flush()
-            if path:
-                handles["state_md"].content = f"**Saved!** {os.path.basename(path)}"
-        was_recording = recording
-
-        if shear_csv_recording and not was_shear_csv_recording:
-            shear_csv_recorder.start()
-        if was_shear_csv_recording and not shear_csv_recording:
-            path = shear_csv_recorder.stop()
-            if path:
-                handles["state_md"].content = f"**Shear CSV saved!** {os.path.basename(path)}"
-        was_shear_csv_recording = shear_csv_recording
-
         if shared.consume_reset():
-            if recorder.num_steps > 0:
-                recorder.flush()
-            if shear_csv_recorder.active:
-                shear_csv_recorder.stop()
-            shared.set_recording(False)
-            shared.set_shear_csv_recording(False)
-            handles["record_btn"].name = "Start Recording"
-            handles["record_btn"].color = "green"
-            handles["shear_csv_btn"].name = "Start Shear CSV"
-            handles["shear_csv_btn"].color = "blue"
-            recording = False
-            shear_csv_recording = False
-            was_recording = False
-            was_shear_csv_recording = False
-
             obs, _ = env.reset()
             for _ in range(warmup_steps):
                 obs, _, _, _, _ = env.step(init_joint_pos)
@@ -2307,6 +1230,7 @@ def main():
         left_gripper = shared.get_gripper("left")
         right_gripper = shared.get_gripper("right")
 
+        # use diffusion IK DifferentialIKController.compute
         left_action = compute_pose(left_ik, left_target_pos, left_target_quat, left_gripper)
         right_action = compute_pose(right_ik, right_target_pos, right_target_quat, right_gripper)
         action = np.concatenate([left_action[:8], right_action[8:]], axis=0).astype(np.float32)
@@ -2323,32 +1247,6 @@ def main():
             pad_axes_w,
             visible=shared.is_show_shear_arrows(),
         )
-
-        if recording:
-            recorder.record(
-                obs,
-                left_target_pos,
-                left_target_quat,
-                left_gripper,
-                right_target_pos,
-                right_target_quat,
-                right_gripper,
-                left_ee_pos=left_ee,
-                left_ee_quat=left_ee_quat,
-                right_ee_pos=right_ee,
-                right_ee_quat=right_ee_quat,
-                joint_commands=action,
-            )
-        if shear_csv_recording:
-            shear_csv_recorder.record(
-                obs,
-                step,
-                left_target_pos=left_target_pos,
-                right_target_pos=right_target_pos,
-                left_ee_pos=left_ee,
-                right_ee_pos=right_ee,
-                pad_axes_w=pad_axes_w,
-            )
 
         update_scene_fast(
             handles,
@@ -2370,45 +1268,22 @@ def main():
                 left_gripper,
                 right_gripper,
                 step,
-                recording,
-                recorder.num_steps,
-                shear_csv_recording,
-                shear_csv_recorder.num_frames,
-                shear_csv_recorder.num_rows,
             )
-
-        if shared.consume_hydro_sample_dump():
-            try:
-                dump_dir = _save_hydro_sample_debug(env, obs, hydro_sample_debug_dir)
-                handles["state_md"].content = f"**Hydro samples saved:** `{dump_dir}`"
-            except Exception as e:
-                handles["state_md"].content = f"**Hydro sample dump failed:** `{e}`"
-                print(f"[hydro_debug] ERROR: {e}", flush=True)
 
         if step % 120 == 0:
             tac = [float(obs["tactile"][i].max()) for i in range(4)]
             force_shear = tactile_shear_uv(obs.get("tactile_shear"))
-            marker_shear = None if bool(args.use_bump_pad) else tactile_marker_vector_uv(obs.get("tactile_marker_shear"))
             contact_count = np.asarray(obs.get("tactile_contact_count", np.zeros(4)), dtype=np.float32).reshape(-1)
             bump_contact_count = np.asarray(obs.get("tactile_bump_contact_count", np.zeros(4)), dtype=np.float32).reshape(-1)
             max_penetration = np.asarray(obs.get("tactile_max_penetration", np.zeros(4)), dtype=np.float32).reshape(-1)
             min_sdf = np.asarray(obs.get("tactile_min_sdf", np.zeros(4)), dtype=np.float32).reshape(-1)
             force_shear_tag = ""
-            marker_shear_tag = ""
             if force_shear is not None:
                 force_shear_tag = (
                     f" force_shear_absmax="
                     f"({float(np.max(np.abs(force_shear[..., 0]))):.4g},"
                     f"{float(np.max(np.abs(force_shear[..., 1]))):.4g})"
                 )
-            if marker_shear is not None:
-                marker_shear_tag = (
-                    f" marker_shear_absmax="
-                    f"({float(np.max(np.abs(marker_shear[..., 0]))):.4g},"
-                    f"{float(np.max(np.abs(marker_shear[..., 1]))):.4g})"
-                )
-            rec_tag = f" REC({recorder.num_steps})" if recording else ""
-            shear_csv_tag = f" SHEAR_CSV({shear_csv_recorder.num_frames})" if shear_csv_recording else ""
             shape_tag = ""
             if step == 0:
                 shape_tag = " shapes=" + ",".join(
@@ -2428,10 +1303,7 @@ def main():
                 f" max_pen={','.join(f'{float(v):.4g}' for v in max_penetration[:4])}"
                 f" min_sdf={','.join(f'{float(v):.4g}' for v in min_sdf[:4])}"
                 f"{force_shear_tag}"
-                f"{marker_shear_tag}"
-                f"{shape_tag}"
-                f"{rec_tag}"
-                f"{shear_csv_tag}",
+                f"{shape_tag}",
                 flush=True,
             )
 
@@ -2439,11 +1311,6 @@ def main():
         if int(args.max_steps) > 0 and step >= int(args.max_steps):
             print(f"[INFO] Reached --max_steps={int(args.max_steps)}; stopping.", flush=True)
             break
-
-    if recorder.num_steps > 0:
-        recorder.flush()
-    if shear_csv_recorder.active:
-        shear_csv_recorder.stop()
 
     env.close()
     simulation_app.close()

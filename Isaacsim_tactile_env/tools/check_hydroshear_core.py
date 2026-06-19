@@ -1140,17 +1140,66 @@ def test_aloha_hydroshear_hardcoded_bump_centers_match_imported_layout():
         normal_direction=-1.0,
     )
     assert centers is not None
-    expected_y = torch.tensor([-0.00771186, 0.0, 0.00771186], dtype=torch.float32)
+    expected_y = torch.tensor([-0.006, -0.002, 0.002, 0.006], dtype=torch.float32)
     expected_z = torch.tensor(
-        [-0.027125, -0.01808333, -0.00904167, 0.0, 0.00904167, 0.01808333, 0.027125],
+        [-0.014, -0.010, -0.006, -0.002, 0.002, 0.006, 0.010, 0.014],
         dtype=torch.float32,
     )
     yy, zz = torch.meshgrid(expected_y, expected_z, indexing="ij")
     expected = torch.stack(
-        (torch.full((21,), -0.0015, dtype=torch.float32), yy.reshape(-1), zz.reshape(-1)),
+        (torch.full((32,), -0.0015, dtype=torch.float32), yy.reshape(-1), zz.reshape(-1)),
         dim=-1,
     )
     assert_close(centers, expected, atol=1.0e-6)
+
+    auto_cfg = AlohaHydroShearTactileBackendCfg(
+        bump_enabled=True,
+        bump_shape_from_active_area=True,
+        bump_pitch_mm=4.0,
+        bump_active_width_mm=26.0,
+        bump_active_length_mm=65.0,
+    )
+    auto_centers = AlohaHydroShearTactileBackend._bump_centers_p_for_backend(
+        auto_cfg,
+        tactile_cfg,
+        vertices,
+        normal_direction=-1.0,
+    )
+    assert auto_centers is not None
+    assert auto_centers.shape == (6 * 16, 3)
+
+    scaled_vertices = torch.tensor(
+        [
+            [-0.0015, -0.025, -0.025],
+            [-0.0015, 0.025, -0.025],
+            [-0.0015, 0.025, 0.025],
+            [-0.0015, -0.025, 0.025],
+            [0.0015, -0.025, -0.025],
+            [0.0015, 0.025, -0.025],
+            [0.0015, 0.025, 0.025],
+            [0.0015, -0.025, 0.025],
+        ],
+        dtype=torch.float32,
+    )
+    scaled_cfg = AlohaHydroShearTactileBackendCfg(
+        bump_enabled=True,
+        bump_shape_from_active_area=True,
+        bump_pitch_mm=4.0,
+        bump_active_width_mm=200.0,
+        bump_active_length_mm=200.0,
+        bump_sim_active_width_mm=50.0,
+        bump_sim_active_length_mm=50.0,
+    )
+    scaled_centers = AlohaHydroShearTactileBackend._bump_centers_p_for_backend(
+        scaled_cfg,
+        tactile_cfg,
+        scaled_vertices,
+        normal_direction=-1.0,
+    )
+    assert scaled_centers is not None
+    assert scaled_centers.shape == (50 * 50, 3)
+    assert_close(scaled_centers[0], torch.tensor([-0.0015, -0.0245, -0.0245]), atol=1.0e-6)
+    assert_close(scaled_centers[-1], torch.tensor([-0.0015, 0.0245, 0.0245]), atol=1.0e-6)
 
 
 def test_aloha_hydroshear_defaults_match_official_marker_lambdas_and_signs():

@@ -34,6 +34,7 @@ class AlohaCamera:
         self.camera = None
         self.render_output_dir = None
         self._base_dir = base_dir
+        self._warned_unready = False
         self._setup(sim_utils)
 
     def _setup(self, sim_utils):
@@ -73,12 +74,20 @@ class AlohaCamera:
             os.makedirs(self.render_output_dir, exist_ok=True)
 
     def reset(self):
-        if self.camera:
+        if not self._camera_ready():
+            return
+        try:
             self.camera.reset()
+        except Exception as e:
+            self._warn_camera_unready(f"reset failed: {e}")
 
     def update(self, dt: float):
-        if self.camera:
+        if not self._camera_ready():
+            return
+        try:
             self.camera.update(dt=dt)
+        except Exception as e:
+            self._warn_camera_unready(f"update failed: {e}")
 
     def save_render(self, rgb: np.ndarray | None, step: int):
         if rgb is None or not self.render_output_dir:
@@ -91,10 +100,19 @@ class AlohaCamera:
             np.save(os.path.join(self.render_output_dir, f"frame_{step:06d}.npy"), rgb)
 
     def output(self) -> AlohaCameraOutput:
-        if not self.camera:
+        if not self._camera_ready():
             return AlohaCameraOutput(rgb=None)
         try:
             rgb = self.camera.data.output["rgb"][0, :, :, :3].detach().cpu().numpy().astype(np.uint8)
         except Exception:
             rgb = None
         return AlohaCameraOutput(rgb=rgb)
+
+    def _camera_ready(self) -> bool:
+        return bool(self.camera is not None and getattr(self.camera, "is_initialized", False) and hasattr(self.camera, "_timestamp"))
+
+    def _warn_camera_unready(self, reason: str):
+        if self._warned_unready:
+            return
+        self._warned_unready = True
+        print(f"[WARN] Camera sensor unavailable; continuing without live RGB ({reason})", flush=True)

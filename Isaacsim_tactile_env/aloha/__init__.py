@@ -10,10 +10,7 @@ from .tactile import (
     AlohaTactileOutput,
     HydroShearTactileBackend,
     HydroShearTactileBackendCfg,
-    TaxelShearTactileBackend,
-    TaxelShearTactileBackendCfg,
     TrackInfo,
-    WarpSdfTactileBackendCfg,
 )
 
 
@@ -37,11 +34,8 @@ __all__ = [
     "AlohaSceneOutput",
     "AlohaTactileCfg",
     "AlohaTactileOutput",
-    "WarpSdfTactileBackendCfg",
     "HydroShearTactileBackend",
     "HydroShearTactileBackendCfg",
-    "TaxelShearTactileBackend",
-    "TaxelShearTactileBackendCfg",
     "DATASET_JOINT_ORDER",
     "TrackInfo",
 ]

@@ -1,10 +1,6 @@
 from .backend import (
     HydroShearTactileBackend,
     HydroShearTactileBackendCfg,
-    TaxelShearTactileBackend,
-    TaxelShearTactileBackendCfg,
-    WarpSdfTactileBackend,
-    WarpSdfTactileBackendCfg,
 )
 from .cfg import AlohaTactileCfg
 from .runtime import AlohaTactileOutput, TrackInfo
@@ -23,10 +19,6 @@ __all__ = [
     "AlohaTactileOutput",
     "AlohaTactileSetup",
     "TrackInfo",
-    "WarpSdfTactileBackendCfg",
-    "WarpSdfTactileBackend",
     "HydroShearTactileBackend",
     "HydroShearTactileBackendCfg",
-    "TaxelShearTactileBackend",
-    "TaxelShearTactileBackendCfg",
 ]

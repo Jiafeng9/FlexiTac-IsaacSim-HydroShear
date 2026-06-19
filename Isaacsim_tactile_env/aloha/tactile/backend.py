@@ -21,39 +21,8 @@ from tactile.readout import (
     ProjectedSurfacePointTrackerCfg,
     SurfacePointForceProjectorCfg,
     TaxelGridCfg,
-    create_taxel_grid_points,
 )
 from tactile.surface import ObjectSurfaceSampler, ObjectSurfaceSamplerCfg
-from tactile.taxel_shear import TaxelShearOutput, TaxelShearTracker, TaxelShearTrackerCfg
-
-
-@dataclass
-class WarpSdfTactileBackendCfg:
-    """Backend parameters for IsaacLab's WarpSDF tactile sensor."""
-
-    mesh_max_dist: float = 0.20
-    mesh_signed: bool = True
-    mesh_signed_distance_method: str = "winding"
-    mesh_shell_thickness: float = 0.001
-    stiffness: float = 5_000.0
-    max_force: float = 10.0
-    normalize_forces: bool = True
-    debug_vis: bool = False
-
-
-@dataclass
-class TaxelShearTactileBackendCfg(WarpSdfTactileBackendCfg):
-    """WarpSDF normal readout plus per-taxel tangential shear state."""
-
-    shear_stiffness: float = 500.0
-    shear_friction_coefficient: float = 0.5
-    shear_contact_threshold: float = 1.0e-6
-    shear_decay: float = 0.0
-    shear_reset_on_contact_loss: bool = True
-    shear_eps: float = 1.0e-8
-    shear_force_sign: float = 1.0
-    include_force_observations: bool = True
-    include_taxel_shear_debug_observations: bool = True
 
 
 @dataclass
@@ -81,8 +50,14 @@ class HydroShearTactileBackendCfg:
     taxel_surface_local_z_dir: float = -1.0
     normal_direction: float | None = None
     bump_enabled: bool = False
-    bump_rows: int = 4
-    bump_cols: int = 8
+    bump_rows: int = 6
+    bump_cols: int = 16
+    bump_shape_from_active_area: bool = False
+    bump_pitch_mm: float | tuple[float, float] = 4.0
+    bump_active_width_mm: float = 26.0
+    bump_active_length_mm: float = 66.65
+    bump_sim_active_width_mm: float | None = None
+    bump_sim_active_length_mm: float | None = None
     bump_center_source: str = "aloha_bump_pad"
     bump_center_surface_band: float | None = None
     bump_center_surface_band_ratio: float = 0.05
@@ -143,334 +118,67 @@ class HydroShearSensorState:
     last_outputs: list[Any] | None = None
 
 
-@dataclass
-class TaxelShearSensorState:
-    link_path: str
-    slot: int
-    patch_pos_b: tuple[float, float, float]
-    patch_quat_b: tuple[float, float, float, float]
-    body_index: int | None = None
-    taxel_positions_e: torch.Tensor | None = None
-    patch_quat_e: torch.Tensor | None = None
-    tracker: TaxelShearTracker | None = None
-    last_output: TaxelShearOutput | None = None
-    last_shear_vec_w: torch.Tensor | None = None
+def bump_pitch_pair_mm(backend_cfg) -> tuple[float, float]:
+    """Return row/column real-world bump pitch in mm."""
+
+    pitch = getattr(backend_cfg, "bump_pitch_mm", 4.0)
+    if isinstance(pitch, (tuple, list)):
+        if len(pitch) != 2:
+            raise ValueError("bump_pitch_mm tuple must contain (row_pitch_mm, col_pitch_mm)")
+        pitch_u_mm, pitch_v_mm = float(pitch[0]), float(pitch[1])
+    else:
+        pitch_u_mm = pitch_v_mm = float(pitch)
+    if pitch_u_mm <= 0.0 or pitch_v_mm <= 0.0:
+        raise ValueError("bump_pitch_mm must be positive")
+    return pitch_u_mm, pitch_v_mm
 
 
-class WarpSdfTactileBackend:
-    """ALOHA binding adapter for IsaacLab's WarpSDF tactile sensor."""
-
-    def __init__(self, cfg, patch_transform, WarpSdfTactileSensor, WarpSdfTactileSensorCfg):
-        self.robot_cfg = cfg.robot
-        self.tactile_cfg = cfg.tactile
-        self.backend_cfg = cfg.tactile.backend
-        self.patch_transform = patch_transform
-        self.WarpSdfTactileSensor = WarpSdfTactileSensor
-        self.WarpSdfTactileSensorCfg = WarpSdfTactileSensorCfg
-
-    def create_sensors(self, selected_links: list[str], target_query_paths: list[str]) -> tuple[list, list[int]]:
-        sensors: list = []
-        slot_order: list[int] = []
-        tactile_cfg = self.tactile_cfg
-        backend_cfg = self.backend_cfg
-
-        for i, link_path in enumerate(selected_links):
-            patch_pos, patch_quat = self.patch_transform.compute(link_path)
-
-            sensor_cfg = self.WarpSdfTactileSensorCfg(
-                prim_path=self.robot_cfg.prim_path,
-                elastomer_prim_paths=[link_path],
-                num_rows=tactile_cfg.num_rows,
-                num_cols=tactile_cfg.num_cols,
-                point_distance=tactile_cfg.point_distance,
-                normal_axis=tactile_cfg.normal_axis,
-                normal_offset=tactile_cfg.normal_offset,
-                patch_offset_pos_b=patch_pos,
-                patch_offset_quat_b=patch_quat,
-                target_mesh_prim_path=target_query_paths[i],
-                mesh_max_dist=backend_cfg.mesh_max_dist,
-                mesh_use_signed_distance=backend_cfg.mesh_signed,
-                mesh_signed_distance_method=backend_cfg.mesh_signed_distance_method,
-                mesh_smooth_normals=True,
-                mesh_shell_thickness=backend_cfg.mesh_shell_thickness,
-                stiffness=backend_cfg.stiffness,
-                max_force=backend_cfg.max_force,
-                normalize_forces=backend_cfg.normalize_forces,
-                debug_vis=backend_cfg.debug_vis,
-            )
-            sensors.append(self.WarpSdfTactileSensor(sensor_cfg))
-
-            slot = sensor_slot(link_path)
-            slot_order.append(slot if slot is not None else i)
-
-        return sensors, slot_order
-
-    def initialize_after_sim_reset(self, sensors: list, stage, target_tracker):
-        pass
-
-    def update(self, dt: float, sensors: list, target_tracker):
-        target_tracker.update_target_poses(sensors)
-        for sensor in sensors:
-            sensor.update(dt=dt)
-
-    def reset(self, sensors: list):
-        for sensor in sensors:
-            sensor.reset()
-
-    def close(self, sensors: list):
-        sensors.clear()
-
-    def observations(self, sensors: list, sensor_slot_order: list[int]) -> dict[str, np.ndarray]:
-        tactile_cfg = self.tactile_cfg
-        tactile = np.zeros((4, tactile_cfg.num_rows, tactile_cfg.num_cols), dtype=np.float32)
-        for i, sensor in enumerate(sensors):
-            data = sensor.data.tactile_points_w
-            if data is None:
-                continue
-            forces = data[0, :, 3].detach().cpu().numpy().astype(np.float32)
-            tactile[sensor_slot_order[i]] = forces.reshape(tactile_cfg.num_rows, tactile_cfg.num_cols)
-        return {tactile_cfg.output_key: tactile}
+def bump_real_active_pair_mm(backend_cfg) -> tuple[float, float]:
+    width_mm = float(getattr(backend_cfg, "bump_active_width_mm", 26.0))
+    length_mm = float(getattr(backend_cfg, "bump_active_length_mm", 66.65))
+    if width_mm <= 0.0 or length_mm <= 0.0:
+        raise ValueError("bump real active width/length must be positive")
+    return width_mm, length_mm
 
 
-class TaxelShearTactileBackend(WarpSdfTactileBackend):
-    """ALOHA adapter for WarpSDF normal forces plus taxel-level shear tracking."""
+def bump_sim_active_pair_mm(backend_cfg) -> tuple[float, float]:
+    real_width_mm, real_length_mm = bump_real_active_pair_mm(backend_cfg)
+    sim_width = getattr(backend_cfg, "bump_sim_active_width_mm", None)
+    sim_length = getattr(backend_cfg, "bump_sim_active_length_mm", None)
+    sim_width_mm = real_width_mm if sim_width is None else float(sim_width)
+    sim_length_mm = real_length_mm if sim_length is None else float(sim_length)
+    if sim_width_mm <= 0.0 or sim_length_mm <= 0.0:
+        raise ValueError("bump sim active width/length must be positive")
+    return sim_width_mm, sim_length_mm
 
-    def __init__(self, cfg, patch_transform, WarpSdfTactileSensor, WarpSdfTactileSensorCfg, robot_asset, device: str):
-        super().__init__(cfg, patch_transform, WarpSdfTactileSensor, WarpSdfTactileSensorCfg)
-        self.robot_asset = robot_asset
-        self.device = device
-        self._states: list[TaxelShearSensorState] = []
 
-    def create_sensors(self, selected_links: list[str], target_query_paths: list[str]) -> tuple[list, list[int]]:
-        sensors, slot_order = super().create_sensors(selected_links, target_query_paths)
-        self._states = []
-        for i, link_path in enumerate(selected_links):
-            patch_pos, patch_quat = self.patch_transform.compute(link_path)
-            slot = sensor_slot(link_path)
-            self._states.append(
-                TaxelShearSensorState(
-                    link_path=link_path,
-                    slot=slot if slot is not None else i,
-                    patch_pos_b=patch_pos,
-                    patch_quat_b=patch_quat,
-                )
-            )
-        return sensors, slot_order
+def bump_sim_pitch_pair_mm(backend_cfg) -> tuple[float, float]:
+    real_pitch_u_mm, real_pitch_v_mm = bump_pitch_pair_mm(backend_cfg)
+    real_width_mm, real_length_mm = bump_real_active_pair_mm(backend_cfg)
+    sim_width_mm, sim_length_mm = bump_sim_active_pair_mm(backend_cfg)
+    return real_pitch_u_mm * sim_width_mm / real_width_mm, real_pitch_v_mm * sim_length_mm / real_length_mm
 
-    def initialize_after_sim_reset(self, sensors: list, stage, target_tracker):
-        del stage, target_tracker
-        for sensor, state in zip(sensors, self._states, strict=False):
-            state.body_index = self._resolve_robot_body_index(state.link_path)
-            state.taxel_positions_e, state.patch_quat_e = self._make_taxel_geometry(state, sensor=sensor)
-            state.tracker = TaxelShearTracker(
-                TaxelShearTrackerCfg(
-                    shear_stiffness=float(self.backend_cfg.shear_stiffness),
-                    friction_coefficient=float(self.backend_cfg.shear_friction_coefficient),
-                    shear_decay=float(self.backend_cfg.shear_decay),
-                    reset_on_contact_loss=bool(self.backend_cfg.shear_reset_on_contact_loss),
-                    force_sign=float(self.backend_cfg.shear_force_sign),
-                    eps=float(self.backend_cfg.shear_eps),
-                )
-            )
-            state.last_output = None
-            state.last_shear_vec_w = None
 
-    def update(self, dt: float, sensors: list, target_tracker):
-        super().update(dt, sensors, target_tracker)
-        for i, (sensor, state) in enumerate(zip(sensors, self._states, strict=False)):
-            if state.tracker is None:
-                continue
-            if getattr(sensor, "_points_local_per_sensor", None) is not None:
-                state.taxel_positions_e, state.patch_quat_e = self._make_taxel_geometry(state, sensor=sensor)
-            elif state.taxel_positions_e is None or state.patch_quat_e is None:
-                state.taxel_positions_e, state.patch_quat_e = self._make_taxel_geometry(state, sensor=sensor)
-            if state.taxel_positions_e is None or state.patch_quat_e is None:
-                continue
+def resolve_bump_grid_shape(backend_cfg) -> tuple[int, int]:
+    """Resolve bump rows/cols from either explicit counts or active area."""
 
-            tactile_points = sensor.data.tactile_points_w
-            if tactile_points is None:
-                continue
-            normal = tactile_points[..., 3].to(device=self.device, dtype=torch.float32)
-            normal_for_limit = normal * float(self.backend_cfg.max_force) if self.backend_cfg.normalize_forces else normal
-            contact = normal_for_limit > float(self.backend_cfg.shear_contact_threshold)
+    if bool(getattr(backend_cfg, "bump_shape_from_active_area", False)):
+        pitch_u_mm, pitch_v_mm = bump_pitch_pair_mm(backend_cfg)
+        active_width_mm, active_length_mm = bump_real_active_pair_mm(backend_cfg)
+        rows = max(1, int(np.floor(active_width_mm / pitch_u_mm + 1.0e-9)))
+        cols = max(1, int(np.floor(active_length_mm / pitch_v_mm + 1.0e-9)))
+    else:
+        rows = int(getattr(backend_cfg, "bump_rows", 6))
+        cols = int(getattr(backend_cfg, "bump_cols", 16))
+    if rows <= 0 or cols <= 0:
+        raise ValueError("bump rows and cols must be positive")
+    return rows, cols
 
-            body_pos_w, body_quat_w = self._sensor_body_pose(sensor, state, num_envs=normal.shape[0])
-            target_pos_w, target_quat_w = self._sensor_target_pose(sensor, target_tracker, sensor_index=i)
-            object_pos_e, object_quat_e = _relative_pose(
-                parent_pos_w=body_pos_w,
-                parent_quat_w=body_quat_w,
-                child_pos_w=target_pos_w,
-                child_quat_w=target_quat_w,
-            )
 
-            state.last_output = state.tracker.update(
-                taxel_positions_e=state.taxel_positions_e,
-                object_pos_e=object_pos_e,
-                object_quat_e=object_quat_e,
-                normal_force=normal_for_limit,
-                contact_mask=contact,
-                patch_quat_e=state.patch_quat_e,
-                normal_axis=int(self.tactile_cfg.normal_axis),
-            )
-            state.last_shear_vec_w = self._shear_to_world(
-                state.last_output.shear_force_uv,
-                body_quat_w=body_quat_w,
-                patch_quat_e=state.patch_quat_e,
-            )
-
-    def reset(self, sensors: list):
-        super().reset(sensors)
-        for state in self._states:
-            if state.tracker is not None:
-                state.tracker.reset()
-            state.last_output = None
-
-    def close(self, sensors: list):
-        super().close(sensors)
-        self._states.clear()
-
-    def observations(self, sensors: list, sensor_slot_order: list[int]) -> dict[str, np.ndarray]:
-        obs = super().observations(sensors, sensor_slot_order)
-        if not bool(getattr(self.backend_cfg, "include_force_observations", False)):
-            return obs
-
-        tactile_cfg = self.tactile_cfg
-        rows, cols = tactile_cfg.num_rows, tactile_cfg.num_cols
-        tactile = obs[tactile_cfg.output_key]
-        tactile_force = np.zeros((4, rows, cols, 3), dtype=np.float32)
-        tactile_shear = np.zeros((4, rows, cols, 2), dtype=np.float32)
-        normal_force_grid = (
-            tactile * float(self.backend_cfg.max_force) if self.backend_cfg.normalize_forces else tactile
-        )
-        tactile_force[..., 0] = normal_force_grid
-
-        for i, state in enumerate(self._states):
-            if state.last_output is None:
-                continue
-            slot = sensor_slot_order[i]
-            shear = state.last_output.shear_force_uv
-            if shear.ndim == 3:
-                shear = shear[0]
-            tactile_shear[slot] = _to_numpy(shear, shape=(rows, cols, 2))
-            tactile_force[slot, :, :, 1:] = tactile_shear[slot]
-
-        obs[f"{tactile_cfg.output_key}_force"] = tactile_force
-        obs[f"{tactile_cfg.output_key}_shear"] = tactile_shear
-        if not bool(getattr(self.backend_cfg, "include_taxel_shear_debug_observations", False)):
-            return obs
-
-        slip_ratio = np.zeros((4, rows, cols), dtype=np.float32)
-        shear_vec_w = np.zeros((4, rows, cols, 3), dtype=np.float32)
-        for i, state in enumerate(self._states):
-            if state.last_output is None:
-                continue
-            slot = sensor_slot_order[i]
-            slip = state.last_output.slip_ratio
-            vec_w = state.last_shear_vec_w
-            if slip.ndim == 2:
-                slip = slip[0]
-            if vec_w is not None and vec_w.ndim == 3:
-                vec_w = vec_w[0]
-            slip_ratio[slot] = _to_numpy(slip, shape=(rows, cols))
-            if vec_w is not None:
-                shear_vec_w[slot] = _to_numpy(vec_w, shape=(rows, cols, 3))
-        obs[f"{tactile_cfg.output_key}_slip_ratio"] = slip_ratio
-        obs[f"{tactile_cfg.output_key}_shear_vector_w"] = shear_vec_w
-        return obs
-
-    def _make_taxel_geometry(self, state: TaxelShearSensorState, *, sensor=None) -> tuple[torch.Tensor, torch.Tensor]:
-        points = getattr(sensor, "_points_local_per_sensor", None)
-        if points is not None:
-            points = points[0].to(device=self.device, dtype=torch.float32)
-            return points, _to_tensor(state.patch_quat_b, device=self.device)
-
-        grid = create_taxel_grid_points(
-            TaxelGridCfg(
-                num_rows=self.tactile_cfg.num_rows,
-                num_cols=self.tactile_cfg.num_cols,
-                point_distance=self.tactile_cfg.point_distance,
-                normal_axis=self.tactile_cfg.normal_axis,
-                normal_offset=self.tactile_cfg.normal_offset,
-                device=self.device,
-            )
-        )
-        patch_pos_b = _to_tensor(state.patch_pos_b, device=self.device)
-        patch_quat_b = _to_tensor(state.patch_quat_b, device=self.device)
-        points_e = quat_apply_wxyz(patch_quat_b.unsqueeze(0).expand(grid.shape[0], -1), grid) + patch_pos_b
-        return points_e, patch_quat_b
-
-    def _sensor_body_pose(self, sensor, state: TaxelShearSensorState, *, num_envs: int) -> tuple[torch.Tensor, torch.Tensor]:
-        pose_sensors = getattr(sensor, "_pose_sensors", None)
-        if pose_sensors:
-            pose_sensor = pose_sensors[0]
-            if getattr(pose_sensor, "is_initialized", False):
-                data = pose_sensor.data
-                if data.pos_w is not None and data.quat_w is not None:
-                    return (
-                        data.pos_w[:num_envs, 0].to(device=self.device, dtype=torch.float32),
-                        data.quat_w[:num_envs, 0].to(device=self.device, dtype=torch.float32),
-                    )
-
-        if state.body_index is None:
-            raise RuntimeError(f"TaxelShear sensor is not initialized: {state.link_path}")
-        body_pos_w = self.robot_asset.data.body_pos_w[:num_envs, state.body_index].to(
-            device=self.device,
-            dtype=torch.float32,
-        )
-        body_quat_w = self.robot_asset.data.body_quat_w[:num_envs, state.body_index].to(
-            device=self.device,
-            dtype=torch.float32,
-        )
-        return body_pos_w, body_quat_w
-
-    def _sensor_target_pose(self, sensor, target_tracker, *, sensor_index: int) -> tuple[torch.Tensor, torch.Tensor]:
-        mesh_pos = getattr(sensor, "_mesh_pos_w", None)
-        mesh_quat = getattr(sensor, "_mesh_quat_w", None)
-        if mesh_pos is not None and mesh_quat is not None:
-            return (
-                mesh_pos.to(device=self.device, dtype=torch.float32),
-                mesh_quat.to(device=self.device, dtype=torch.float32),
-            )
-
-        target_pos_w, target_quat_w = target_tracker.target_pose_for_sensor(sensor_index)
-        return _to_tensor(target_pos_w, device=self.device), _to_tensor(target_quat_w, device=self.device)
-
-    def _shear_to_world(
-        self,
-        shear_uv: torch.Tensor,
-        *,
-        body_quat_w: torch.Tensor,
-        patch_quat_e: torch.Tensor,
-    ) -> torch.Tensor:
-        shear_uv = shear_uv.to(device=self.device, dtype=torch.float32)
-        num_envs, num_points = shear_uv.shape[:2]
-        shear_patch = torch.zeros((num_envs, num_points, 3), device=self.device, dtype=torch.float32)
-        tangent_axes = [0, 1, 2]
-        tangent_axes.remove(int(self.tactile_cfg.normal_axis))
-        shear_patch[..., tangent_axes] = shear_uv
-        patch_quat = patch_quat_e.view(1, 1, 4).expand(num_envs, num_points, -1)
-        shear_body = quat_apply_wxyz(patch_quat, shear_patch)
-        body_quat = body_quat_w.view(num_envs, 1, 4).expand(num_envs, num_points, -1)
-        return quat_apply_wxyz(body_quat, shear_body)
-
-    def _resolve_robot_body_index(self, link_path: str) -> int:
-        body_names = [str(n) for n in self.robot_asset.body_names]
-        body_names_l = [n.lower() for n in body_names]
-        link_l = link_path.lower()
-        leaf = link_l.rsplit("/", 1)[-1]
-
-        for token in (leaf, leaf.replace("_link", "")):
-            if token in body_names_l:
-                return body_names_l.index(token)
-
-        cands = [
-            i
-            for i, name in enumerate(body_names_l)
-            if name in link_l or leaf in name or name.endswith(leaf) or leaf.endswith(name)
-        ]
-        if not cands:
-            raise RuntimeError(f"Cannot map elastomer prim to robot body: {link_path}. Bodies: {body_names}")
-        return min(cands, key=lambda i: len(body_names_l[i]))
+def resolve_tactile_grid_shape(backend_cfg, tactile_cfg) -> tuple[int, int]:
+    if getattr(backend_cfg, "bump_enabled", False):
+        return resolve_bump_grid_shape(backend_cfg)
+    return int(tactile_cfg.num_rows), int(tactile_cfg.num_cols)
 
 
 class HydroShearTactileBackend:
@@ -487,9 +195,7 @@ class HydroShearTactileBackend:
         self._stage = None
 
     def _output_grid_shape(self) -> tuple[int, int]:
-        if bool(getattr(self.backend_cfg, "bump_enabled", False)):
-            return int(self.backend_cfg.bump_rows), int(self.backend_cfg.bump_cols)
-        return int(self.tactile_cfg.num_rows), int(self.tactile_cfg.num_cols)
+        return resolve_tactile_grid_shape(self.backend_cfg, self.tactile_cfg)
 
     def _core_output_mode(self) -> str:
         output_mode = str(getattr(self.backend_cfg, "output_mode", "force_grid"))
@@ -829,23 +535,30 @@ class HydroShearTactileBackend:
         tangent_axes = [0, 1, 2]
         tangent_axes.remove(normal_axis)
         axis_u, axis_v = tangent_axes
-        rows = int(backend_cfg.bump_rows)
-        cols = int(backend_cfg.bump_cols)
+        rows, cols = resolve_bump_grid_shape(backend_cfg)
 
         normal_values = vertices[:, normal_axis]
+        bounds = torch.stack((vertices.min(dim=0).values, vertices.max(dim=0).values), dim=0)
+        center = 0.5 * (bounds[0] + bounds[1])
 
-        def axis_centers(count: int, target_extent_m: float) -> torch.Tensor:
+        pitch_u_mm, pitch_v_mm = bump_sim_pitch_pair_mm(backend_cfg)
+        active_width_mm, active_length_mm = bump_sim_active_pair_mm(backend_cfg)
+
+        def axis_centers(count: int, pitch_mm: float, active_extent_mm: float, axis: int) -> torch.Tensor:
             if count <= 0:
                 raise ValueError("bump rows and cols must be positive")
-            # From bump_strip_generator.py / README: pitch=8.75 mm and
-            # base_radius + border = 4 mm + 2 mm on each side.
-            pitch_mm = 8.75
-            source_extent_mm = float(count - 1) * pitch_mm + 12.0
-            source_centers_mm = (torch.arange(count, dtype=vertices.dtype, device=vertices.device) - (count - 1) / 2.0) * pitch_mm
-            return source_centers_mm * (float(target_extent_m) / source_extent_mm)
+            if pitch_mm <= 0.0:
+                raise ValueError("bump pitch must be positive")
+            span_mm = float(count - 1) * float(pitch_mm)
+            if span_mm > float(active_extent_mm) + 1.0e-6:
+                raise ValueError(
+                    f"bump grid span {span_mm:.3f} mm exceeds active extent {float(active_extent_mm):.3f} mm"
+                )
+            offsets_mm = (torch.arange(count, dtype=vertices.dtype, device=vertices.device) - (count - 1) / 2.0) * float(pitch_mm)
+            return center[axis] + offsets_mm * 0.001
 
-        u = axis_centers(rows, 0.026)
-        v = axis_centers(cols, 0.06665)
+        u = axis_centers(rows, pitch_u_mm, active_width_mm, axis_u)
+        v = axis_centers(cols, pitch_v_mm, active_length_mm, axis_v)
         uu, vv = torch.meshgrid(u, v, indexing="ij")
         centers = torch.zeros((rows * cols, 3), dtype=vertices.dtype, device=vertices.device)
         centers[:, axis_u] = uu.reshape(-1)
@@ -1084,10 +797,21 @@ def _converted_usd_elastomer_collider_mesh_vertices_faces(
     from pxr import Usd
 
     usd_dir = Path(converted_usd_dir)
-    candidates = (
+    candidates: list[Path] = []
+    for pattern in (
+        "configuration/*_base.usd",
+        "configuration/*.usd",
+        "*.usd",
+    ):
+        for path in sorted(usd_dir.glob(pattern)):
+            if path not in candidates:
+                candidates.append(path)
+    for path in (
         usd_dir / "configuration" / "aloha_tactile_base.usd",
         usd_dir / "aloha_tactile.usd",
-    )
+    ):
+        if path not in candidates:
+            candidates.append(path)
 
     errors: list[str] = []
     for usd_path in candidates:

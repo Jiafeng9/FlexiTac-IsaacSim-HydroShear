@@ -222,8 +222,8 @@ class BumpHydroShearCfg:
     """Per-bump HydroShear state with penetration-based normal force."""
 
     enabled: bool = False
-    num_rows: int = 4
-    num_cols: int = 8
+    num_rows: int = 6
+    num_cols: int = 16
     centers_p: torch.Tensor | None = None
     center_source: str = "mesh_surface"
     center_surface_band: float | None = None

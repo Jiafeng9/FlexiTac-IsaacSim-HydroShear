@@ -3,6 +3,8 @@ from __future__ import annotations
 import gymnasium
 import numpy as np
 
+from .tactile.backend import resolve_tactile_grid_shape
+
 
 class AlohaObservationBuilder:
     """Observation and Gym space construction."""
@@ -76,19 +78,6 @@ class AlohaObservationBuilder:
                 shape=(4, rows, cols, 2),
                 dtype=np.float32,
             )
-            if getattr(tactile_cfg.backend, "include_taxel_shear_debug_observations", False):
-                obs_spaces[f"{output_key}_slip_ratio"] = gymnasium.spaces.Box(
-                    -np.inf,
-                    np.inf,
-                    shape=(4, rows, cols),
-                    dtype=np.float32,
-                )
-                obs_spaces[f"{output_key}_shear_vector_w"] = gymnasium.spaces.Box(
-                    -np.inf,
-                    np.inf,
-                    shape=(4, rows, cols, 3),
-                    dtype=np.float32,
-                )
         if getattr(tactile_cfg.backend, "include_marker_observations", False):
             for suffix in ("marker", "marker_dilation", "marker_shear"):
                 obs_spaces[f"{output_key}_{suffix}"] = gymnasium.spaces.Box(
@@ -97,41 +86,6 @@ class AlohaObservationBuilder:
                     shape=(4, rows, cols, 3),
                     dtype=np.float32,
                 )
-        if getattr(tactile_cfg, "enable_hydro_normal_observation", False):
-            hydro_key = tactile_cfg.hydro_normal_output_key
-            hydro_primary_shape = self._tactile_primary_shape(tactile_cfg.hydro_normal_backend, tactile_cfg)
-            hydro_rows, hydro_cols = self._tactile_grid_shape(tactile_cfg.hydro_normal_backend, tactile_cfg)
-            obs_spaces[hydro_key] = gymnasium.spaces.Box(
-                -np.inf,
-                np.inf,
-                shape=(4,) + hydro_primary_shape,
-                dtype=np.float32,
-            )
-            obs_spaces[f"{hydro_key}_contact_count"] = gymnasium.spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32)
-            obs_spaces[f"{hydro_key}_bump_contact_count"] = gymnasium.spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32)
-            obs_spaces[f"{hydro_key}_max_penetration"] = gymnasium.spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32)
-            obs_spaces[f"{hydro_key}_min_sdf"] = gymnasium.spaces.Box(-np.inf, np.inf, shape=(4,), dtype=np.float32)
-            if getattr(tactile_cfg.hydro_normal_backend, "include_force_observations", False):
-                obs_spaces[f"{hydro_key}_force"] = gymnasium.spaces.Box(
-                    -np.inf,
-                    np.inf,
-                    shape=(4, hydro_rows, hydro_cols, 3),
-                    dtype=np.float32,
-                )
-                obs_spaces[f"{hydro_key}_shear"] = gymnasium.spaces.Box(
-                    -np.inf,
-                    np.inf,
-                    shape=(4, hydro_rows, hydro_cols, 2),
-                    dtype=np.float32,
-                )
-            if getattr(tactile_cfg.hydro_normal_backend, "include_marker_observations", False):
-                for suffix in ("marker", "marker_dilation", "marker_shear"):
-                    obs_spaces[f"{hydro_key}_{suffix}"] = gymnasium.spaces.Box(
-                        -np.inf,
-                        np.inf,
-                        shape=(4, hydro_rows, hydro_cols, 3),
-                        dtype=np.float32,
-                    )
         if self.camera.camera:
             obs_spaces["rgb"] = gymnasium.spaces.Box(
                 0,
@@ -146,9 +100,7 @@ class AlohaObservationBuilder:
 
     @staticmethod
     def _tactile_grid_shape(backend_cfg, tactile_cfg) -> tuple[int, int]:
-        if getattr(backend_cfg, "bump_enabled", False):
-            return int(getattr(backend_cfg, "bump_rows", 4)), int(getattr(backend_cfg, "bump_cols", 8))
-        return int(tactile_cfg.num_rows), int(tactile_cfg.num_cols)
+        return resolve_tactile_grid_shape(backend_cfg, tactile_cfg)
 
     @staticmethod
     def _tactile_primary_shape(backend_cfg, tactile_cfg) -> tuple[int, ...]:
